@@ -1,0 +1,38 @@
+# Environment & Secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual Environment
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# User Data (created at runtime)
+data/
+uploads/
+logs/
+plans/
+user_profile.yaml
+coach_state.json
+checkin_log.json
+
+# PyInstaller
+*.spec.bak
+
+# Model files (downloaded on first run)
+*.gguf
+
+launch.log
