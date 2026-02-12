@@ -1782,10 +1782,27 @@ def render_settings():
         if "strava_activities_df" not in st.session_state:
             _sync_strava()
     elif has_credentials:
-        # Not connected yet — show the connect button
+        # ── Strava Connect ────────────────────────────────────────────
+        # Streamlit Community Cloud has its own auth proxy that intercepts
+        # ALL incoming requests (303 → share.streamlit.io → login → back).
+        # This proxy preserves Strava's ?code= query params through the
+        # redirect chain, creating an infinite loop that never reaches the
+        # Python code.  Direct redirect-based OAuth is therefore impossible.
+        #
+        # Solution: open Strava auth in a NEW TAB (target="_blank").  The
+        # user authorises, Strava redirects the *new tab* which can't load
+        # (since the redirect_uri points back to the app which loops), but
+        # the auth code is visible in the new tab's URL bar.  The user
+        # copies the code and pastes it here.
         auth_url = strava_auth_url(_STRAVA_CLIENT_ID, _STRAVA_REDIRECT_URI)
+
+        st.markdown(
+            "**Step 1** — Click the button below to authorise with Strava.  "
+            "A new tab will open. After you approve access, the new tab "
+            "may show an error page — **that's expected**."
+        )
         st.markdown(f"""
-        <a href="{auth_url}" target="_self" style="
+        <a href="{auth_url}" target="_blank" rel="noopener" style="
             display:inline-flex;align-items:center;gap:10px;
             background:#FC4C02;color:#fff;font-weight:700;
             padding:12px 24px;border-radius:8px;text-decoration:none;
@@ -1796,6 +1813,54 @@ def render_settings():
             Connect with Strava
         </a>
         """, unsafe_allow_html=True)
+
+        st.markdown(
+            "**Step 2** — Copy the **full URL** from the new tab's address bar "
+            "(it will look like `https://sakerpro.streamlit.app/?code=abc123…`) "
+            "and paste it below."
+        )
+        pasted_url = st.text_input(
+            "Paste the redirect URL here",
+            key="strava_code_input",
+            placeholder="https://sakerpro.streamlit.app/?code=…",
+            label_visibility="collapsed",
+        )
+        if st.button("Complete Connection", key="strava_submit_code", type="primary"):
+            # Extract the code from a full URL or accept a bare code
+            _code = ""
+            if pasted_url:
+                if "code=" in pasted_url:
+                    from urllib.parse import urlparse, parse_qs
+                    try:
+                        qs = parse_qs(urlparse(pasted_url).query)
+                        _code = qs.get("code", [""])[0]
+                    except Exception:
+                        _code = pasted_url.strip()
+                else:
+                    _code = pasted_url.strip()
+
+            if not _code:
+                st.warning("Please paste the redirect URL or authorisation code.")
+            else:
+                try:
+                    strava_exchange_code(
+                        _STRAVA_CLIENT_ID,
+                        _STRAVA_CLIENT_SECRET,
+                        _code,
+                        redirect_uri=_STRAVA_REDIRECT_URI,
+                    )
+                    st.session_state["_strava_exchanged"] = True
+                    st.success("Strava connected! Syncing activities…")
+                    _sync_strava()
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Token exchange failed: {e}")
+                    with st.expander("Debug details"):
+                        st.code(
+                            f"redirect_uri: {_STRAVA_REDIRECT_URI}\n"
+                            f"code:         {_code[:20]}…\n"
+                            f"error:        {e}"
+                        )
 
     # Show current data status
     st.markdown("---")
