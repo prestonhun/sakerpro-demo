@@ -151,11 +151,12 @@ def is_connected() -> bool:
 
 def get_authorization_url(client_id: str, redirect_uri: str) -> str:
     """Build Strava OAuth authorization URL."""
+    from urllib.parse import quote
     return (
         f"{STRAVA_AUTH_URL}"
         f"?client_id={client_id}"
         f"&response_type=code"
-        f"&redirect_uri={redirect_uri}"
+        f"&redirect_uri={quote(redirect_uri, safe='')}"
         f"&scope={REQUIRED_SCOPES}"
         f"&approval_prompt=auto"
     )

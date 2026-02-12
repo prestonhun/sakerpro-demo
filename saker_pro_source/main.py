@@ -912,6 +912,7 @@ def render_dashboard(workouts_df, activities_df, nutrition_df, weight_df, using_
     # ── FASTEST RUN PRETTYMAP (Strava route overlay) ───────────────────
     render_fastest_run_map_section(
         st.session_state.get("strava_fastest_routes"),
+        st.session_state.get("strava_raw"),
         using_demo=using_demo,
         key_prefix="dashboard_fastest_route",
     )
