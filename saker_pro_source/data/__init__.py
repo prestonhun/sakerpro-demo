@@ -1,7 +1,5 @@
 # saker_pro_source/data/__init__.py
 """Data loading and demo data generation."""
-
-from .data_loader import load_workouts
 from .demo_data import (
     generate_all_demo_data,
     generate_demo_workouts,
@@ -12,7 +10,6 @@ from .demo_data import (
 )
 
 __all__ = [
-    "load_workouts",
     "generate_all_demo_data",
     "generate_demo_workouts",
     "generate_demo_activities",

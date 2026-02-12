@@ -351,11 +351,11 @@ def enrich_activity_locations(
     max_geocode_lookups: int = 35,
     detail_sleep_s: float = 0.25,
 ) -> list[dict]:
-        """Enrich activities with `location_city/state/country`.
+    """Enrich activities with `location_city/state/country`.
 
-        Streamlit Community Cloud friendly:
-        - avoids SciPy/GEOS heavy dependencies
-        - uses local YAML caches (under `~/.saker_pro/`)
+    Streamlit Community Cloud friendly:
+    - avoids SciPy/GEOS heavy dependencies
+    - uses local YAML caches (under `~/.saker_pro/`)
 
         Strategy:
         - prefers location fields already present in Strava activity summaries
