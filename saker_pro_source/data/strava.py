@@ -34,12 +34,6 @@ _GEOCODE_CACHE_FILE = Path.home() / ".saker_pro" / "geocode_cache.yaml"
 
 def _ensure_dir() -> None:
     _TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
-    # Best-effort hardening for local token/cache storage.
-    # (No-op on platforms/filesystems that don't support chmod.)
-    try:
-        _TOKEN_FILE.parent.chmod(0o700)
-    except Exception:
-        pass
 
 
 def _load_location_cache() -> dict:
@@ -56,10 +50,6 @@ def _save_location_cache(cache: dict) -> None:
     _ensure_dir()
     try:
         _LOCATION_CACHE_FILE.write_text(yaml.dump(cache, default_flow_style=False))
-        try:
-            _LOCATION_CACHE_FILE.chmod(0o600)
-        except Exception:
-            pass
     except Exception:
         pass
 
@@ -78,10 +68,6 @@ def _save_geocode_cache(cache: dict) -> None:
     _ensure_dir()
     try:
         _GEOCODE_CACHE_FILE.write_text(yaml.dump(cache, default_flow_style=False))
-        try:
-            _GEOCODE_CACHE_FILE.chmod(0o600)
-        except Exception:
-            pass
     except Exception:
         pass
 
@@ -98,8 +84,7 @@ def _reverse_geocode_nominatim(lat: float, lon: float) -> dict:
             "format": "jsonv2",
             "lat": f"{lat:.7f}",
             "lon": f"{lon:.7f}",
-            # zoom=14 is typically city/town level; 10 often returns only state.
-            "zoom": 14,
+            "zoom": 10,
             "addressdetails": 1,
         },
         headers={"User-Agent": "sakerpro-demo/1.0 (Streamlit; location enrichment)"},
@@ -111,27 +96,9 @@ def _reverse_geocode_nominatim(lat: float, lon: float) -> dict:
     if not isinstance(address, dict):
         address = {}
 
-    city = (
-        address.get("city")
-        or address.get("town")
-        or address.get("village")
-        or address.get("hamlet")
-        or address.get("municipality")
-        or address.get("suburb")
-        or address.get("neighbourhood")
-        or address.get("locality")
-    )
-    state = (
-        address.get("state")
-        or address.get("state_district")
-        or address.get("region")
-        or address.get("county")
-        or address.get("district")
-    )
+    city = address.get("city") or address.get("town") or address.get("village") or address.get("hamlet")
+    state = address.get("state") or address.get("region")
     country = address.get("country")
-    if not country:
-        cc = address.get("country_code")
-        country = cc.upper() if isinstance(cc, str) and cc else ""
     return {
         "city": city or "",
         "state": state or "",
@@ -152,10 +119,6 @@ def save_tokens(tokens: dict) -> None:
         "athlete_lastname": athlete.get("lastname") or tokens.get("athlete_lastname", ""),
     }
     _TOKEN_FILE.write_text(yaml.dump(payload, default_flow_style=False))
-    try:
-        _TOKEN_FILE.chmod(0o600)
-    except Exception:
-        pass
 
 
 def load_tokens() -> dict | None:
@@ -198,18 +161,40 @@ def get_authorization_url(client_id: str, redirect_uri: str) -> str:
     )
 
 
-def exchange_code(client_id: str, client_secret: str, code: str) -> dict:
-    """Exchange authorization code for access + refresh tokens."""
-    resp = requests.post(
-        STRAVA_TOKEN_URL,
-        data={
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "code": code,
-            "grant_type": "authorization_code",
-        },
-        timeout=15,
-    )
+def exchange_code(
+    client_id: str,
+    client_secret: str,
+    code: str,
+    redirect_uri: str | None = None,
+) -> dict:
+    """Exchange authorization code for access + refresh tokens.
+
+    Parameters
+    ----------
+    redirect_uri : str | None
+        Must exactly match the redirect_uri used in the authorize URL.
+        Strava returns HTTP 400 "Bad Request" on mismatch.
+    """
+    payload: dict[str, str] = {
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "code": code,
+        "grant_type": "authorization_code",
+    }
+    if redirect_uri:
+        payload["redirect_uri"] = redirect_uri
+
+    resp = requests.post(STRAVA_TOKEN_URL, data=payload, timeout=15)
+
+    # Surface a clear message instead of a generic 400
+    if resp.status_code == 400:
+        detail = resp.json() if resp.content else {}
+        msg = detail.get("message", detail.get("error", resp.text))
+        raise RuntimeError(
+            f"Strava token exchange failed (400): {msg}. "
+            f"Check redirect_uri matches exactly (sent: {redirect_uri!r})."
+        )
+
     resp.raise_for_status()
     tokens = resp.json()
     save_tokens(tokens)
@@ -351,19 +336,14 @@ def enrich_activity_locations(
     max_geocode_lookups: int = 35,
     detail_sleep_s: float = 0.25,
 ) -> list[dict]:
-    """Enrich activities with `location_city/state/country`.
+    """Enrich activities with `location_city/state/country` using Strava-only data.
 
     Streamlit Community Cloud friendly:
     - avoids SciPy/GEOS heavy dependencies
-    - uses local YAML caches (under `~/.saker_pro/`)
+    - avoids third-party geocoding services
 
-        Strategy:
-        - prefers location fields already present in Strava activity summaries
-        - optionally falls back to Strava activity detail endpoint (rate-limited + cached)
-        - optionally falls back to OSM Nominatim reverse geocoding when enabled
-            (`allow_external_geocode=True`), which sends approximate coordinates to a
-            third-party service.
-        """
+    Uses the activity detail endpoint as a fallback and caches results locally.
+    """
     if not activities:
         return []
 
@@ -374,31 +354,8 @@ def enrich_activity_locations(
     geo_cache = _load_geocode_cache()
     cache_changed = False
     lookups_used = 0
+    geocode_used = 0
     geocode_changed = False
-
-    # We'll pick a capped set of unique lat/lon keys spread across the
-    # *entire* activity history (not just the first N) to avoid missing
-    # older/remote locations.
-    pending_geo: list[tuple[int, str]] = []
-
-    def _geo_key(lat: float, lon: float, *, precision: int = 3) -> str:
-        # 3 decimals ≈ 110m; collapses nearby start points into one key.
-        fmt = f"{{:.{precision}f}},{{:.{precision}f}}"
-        return fmt.format(lat, lon)
-
-    def _lookup_geo_cache(lat: float, lon: float) -> tuple[str, dict | None]:
-        """Return (key, place) trying both new (3dp) and legacy (4dp) keys."""
-        if not isinstance(geo_cache, dict):
-            return "", None
-        k3 = _geo_key(lat, lon, precision=3)
-        v3 = geo_cache.get(k3)
-        if isinstance(v3, dict):
-            return k3, v3
-        k4 = _geo_key(lat, lon, precision=4)
-        v4 = geo_cache.get(k4)
-        if isinstance(v4, dict):
-            return k4, v4
-        return k3, None
 
     enriched: list[dict] = []
     for act in activities:
@@ -462,7 +419,7 @@ def enrich_activity_locations(
             except Exception:
                 pass
 
-        # Track any remaining missing locations for a later, capped geocode pass.
+        # Final fallback: reverse geocode start_latlng (cached + rate-limited)
         city = _norm_str(out.get("location_city"))
         state = _norm_str(out.get("location_state"))
         country = _norm_str(out.get("location_country"))
@@ -470,128 +427,37 @@ def enrich_activity_locations(
 
         start = out.get("start_latlng")
         has_latlng = isinstance(start, (list, tuple)) and len(start) == 2 and all(v is not None for v in start)
-        if allow_external_geocode and missing_any and has_latlng:
+
+        if allow_external_geocode and missing_any and has_latlng and geocode_used < max_geocode_lookups:
             try:
                 lat, lon = float(start[0]), float(start[1])
-                key, place = _lookup_geo_cache(lat, lon)
-                out["_geo_key"] = key
-                # Apply cached geocode immediately (covers many activities once key precision is coarse)
-                if isinstance(place, dict):
+                # Round to reduce unique keys (privacy + fewer lookups)
+                key = f"{lat:.4f},{lon:.4f}"
+                cached = geo_cache.get(key) if isinstance(geo_cache, dict) else None
+                if isinstance(cached, dict):
+                    if not city and _norm_str(cached.get("city")):
+                        out["location_city"] = cached.get("city")
+                    if not state and _norm_str(cached.get("state")):
+                        out["location_state"] = cached.get("state")
+                    if not country and _norm_str(cached.get("country")):
+                        out["location_country"] = cached.get("country")
+                else:
+                    # Respect Nominatim usage guidelines (roughly 1 req/sec)
+                    time.sleep(1.05)
+                    place = _reverse_geocode_nominatim(lat, lon)
+                    geo_cache[key] = place
+                    geocode_changed = True
                     if not city and _norm_str(place.get("city")):
                         out["location_city"] = place.get("city")
                     if not state and _norm_str(place.get("state")):
                         out["location_state"] = place.get("state")
                     if not country and _norm_str(place.get("country")):
                         out["location_country"] = place.get("country")
-
-                # If we're still missing anything (or cache is incomplete), schedule for re-geocode.
-                city2 = _norm_str(out.get("location_city"))
-                state2 = _norm_str(out.get("location_state"))
-                country2 = _norm_str(out.get("location_country"))
-                if (not city2) or (not state2) or (not country2):
-                    pending_geo.append((len(enriched), key))
+                    geocode_used += 1
             except Exception:
                 pass
 
         enriched.append(out)
-
-    # Geocode pass (cached + rate-limited)
-    if allow_external_geocode and pending_geo and isinstance(geo_cache, dict):
-        def _incomplete_place(v: Any) -> bool:
-            if not isinstance(v, dict):
-                return True
-            return (not _norm_str(v.get("city"))) or (not _norm_str(v.get("state"))) or (not _norm_str(v.get("country")))
-
-        # Determine which unique keys still need lookups
-        key_counts: dict[str, int] = {}
-        for _, k in pending_geo:
-            key_counts[k] = key_counts.get(k, 0) + 1
-
-        # Include keys that are missing from cache OR have incomplete cached data
-        unique_keys: list[str] = [k for k in key_counts.keys() if (k not in geo_cache) or _incomplete_place(geo_cache.get(k))]
-
-        # Select keys to maximize coverage:
-        # - geographic outliers (min/max lat/lon)
-        # - most common keys (resolve majority area first)
-        # - plus spread across history (front/back alternation)
-        selected: list[str] = []
-        selected_set: set[str] = set()
-
-        def _add(k: str) -> None:
-            if k and k not in selected_set and len(selected) < max_geocode_lookups:
-                selected.append(k)
-                selected_set.add(k)
-
-        parsed: list[tuple[str, float, float]] = []
-        for k in unique_keys:
-            try:
-                lat_s, lon_s = k.split(",", 1)
-                parsed.append((k, float(lat_s), float(lon_s)))
-            except Exception:
-                continue
-
-        if parsed:
-            min_lat_k = min(parsed, key=lambda x: x[1])[0]
-            max_lat_k = max(parsed, key=lambda x: x[1])[0]
-            min_lon_k = min(parsed, key=lambda x: x[2])[0]
-            max_lon_k = max(parsed, key=lambda x: x[2])[0]
-            for k in (min_lat_k, max_lat_k, min_lon_k, max_lon_k):
-                _add(k)
-
-        # Resolve the densest cluster first (typically "home" location)
-        for k, _cnt in sorted(key_counts.items(), key=lambda kv: kv[1], reverse=True):
-            if k in geo_cache and not _incomplete_place(geo_cache.get(k)):
-                continue
-            _add(k)
-            if len(selected) >= max_geocode_lookups:
-                break
-
-        i, j = 0, len(unique_keys) - 1
-        while i <= j and len(selected) < max_geocode_lookups:
-            _add(unique_keys[i])
-            i += 1
-            if i <= j and len(selected) < max_geocode_lookups:
-                _add(unique_keys[j])
-                j -= 1
-
-        for k in selected:
-            try:
-                lat_s, lon_s = k.split(",", 1)
-                lat, lon = float(lat_s), float(lon_s)
-                time.sleep(1.05)
-                # Store under the key we requested (3dp), not the raw lat/lon.
-                geo_cache[k] = _reverse_geocode_nominatim(lat, lon)
-                geocode_changed = True
-            except Exception:
-                continue
-
-        # Apply cache back onto enriched activities
-        for out in enriched:
-            k = out.get("_geo_key")
-            if not k or not isinstance(k, str):
-                continue
-            place = geo_cache.get(k)
-            if not isinstance(place, dict):
-                continue
-
-            city = _norm_str(out.get("location_city"))
-            state = _norm_str(out.get("location_state"))
-            country = _norm_str(out.get("location_country"))
-
-            if not city and _norm_str(place.get("city")):
-                out["location_city"] = place.get("city")
-            if not state and _norm_str(place.get("state")):
-                out["location_state"] = place.get("state")
-            if not country and _norm_str(place.get("country")):
-                out["location_country"] = place.get("country")
-
-            # Ensure state is present for places that don't have an admin1 in OSM.
-            if not _norm_str(out.get("location_state")) and _norm_str(out.get("location_country")):
-                out["location_state"] = out.get("location_country")
-
-        # Strip internal key
-        for out in enriched:
-            out.pop("_geo_key", None)
 
     if cache_changed:
         _save_location_cache(cache)

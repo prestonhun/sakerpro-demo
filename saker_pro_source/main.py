@@ -7,23 +7,13 @@ Supports Strava Connect for real activity data; other sources use demo data.
 """
 
 import base64
-import os
 import sys
 from pathlib import Path
-import importlib.util
 
-# Ensure imports work both locally and on Streamlit Community Cloud.
-# Cloud runs from the repo root, so we add both:
-# - repo root (so `saker_pro_source` is importable as a package)
-# - this file's directory (so `data.*` and `ui.*` absolute imports work)
+# Ensure saker_pro_source is on sys.path for local imports
 _SAKER_DIR = Path(__file__).parent.resolve()
-_REPO_ROOT = _SAKER_DIR.parent
-# Keep repo root ahead of saker_pro_source/ so `import saker_pro_source...` works.
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
-# Add saker_pro_source/ as a secondary import root for legacy `import data` / `import ui`.
 if str(_SAKER_DIR) not in sys.path:
-    sys.path.append(str(_SAKER_DIR))
+    sys.path.insert(0, str(_SAKER_DIR))
 
 # --- Third Party ---
 import numpy as np
@@ -34,112 +24,35 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 # --- Local ---
-# Prefer package imports (works on Streamlit Cloud from repo root),
-# with fallback to legacy imports (works when running inside saker_pro_source/).
-try:
-    from saker_pro_source.data.demo_data import (
-        generate_all_demo_data,
-        generate_demo_activities,
-        generate_demo_nutrition,
-        generate_demo_weight,
-        is_demo_data,
-    )
-    from saker_pro_source.data.strava import (
-        is_connected as strava_is_connected,
-        get_authorization_url as strava_auth_url,
-        exchange_code as strava_exchange_code,
-        clear_tokens as strava_clear_tokens,
-        load_tokens as strava_load_tokens,
-        fetch_activities as strava_fetch_activities,
-        get_athlete as strava_get_athlete,
-        activities_to_cardio_df,
-        activities_to_workouts_df,
-        get_best_run_efforts,
-        get_fastest_run_routes,
-        enrich_activity_locations,
-    )
-    from saker_pro_source.ui.icons import get_icon
-    from saker_pro_source.ui.theme import apply_new_styles
-    from saker_pro_source.ui.widgets import (
-        render_custom_metric_card,
-        render_timeline_buttons,
-        render_fastest_run_map_section,
-        render_activity_start_map_section,
-    )
-except ModuleNotFoundError:
-    try:
-        from data.demo_data import (
-            generate_all_demo_data,
-            generate_demo_activities,
-            generate_demo_nutrition,
-            generate_demo_weight,
-            is_demo_data,
-        )
-        from data.strava import (
-            is_connected as strava_is_connected,
-            get_authorization_url as strava_auth_url,
-            exchange_code as strava_exchange_code,
-            clear_tokens as strava_clear_tokens,
-            load_tokens as strava_load_tokens,
-            fetch_activities as strava_fetch_activities,
-            get_athlete as strava_get_athlete,
-            activities_to_cardio_df,
-            activities_to_workouts_df,
-            get_best_run_efforts,
-            get_fastest_run_routes,
-            enrich_activity_locations,
-        )
-        from ui.icons import get_icon
-        from ui.theme import apply_new_styles
-        from ui.widgets import (
-            render_custom_metric_card,
-            render_timeline_buttons,
-            render_fastest_run_map_section,
-            render_activity_start_map_section,
-        )
-    except ModuleNotFoundError:
-        # Final fallback: load modules directly from file paths.
-        def _load_module(name: str, path: Path):
-            spec = importlib.util.spec_from_file_location(name, str(path))
-            if spec is None or spec.loader is None:
-                raise ModuleNotFoundError(f"Cannot load module {name} from {path}")
-            mod = importlib.util.module_from_spec(spec)
-            sys.modules[name] = mod
-            spec.loader.exec_module(mod)
-            return mod
-
-        _demo = _load_module("_saker_demo_data", _SAKER_DIR / "data" / "demo_data.py")
-        _strava = _load_module("_saker_strava", _SAKER_DIR / "data" / "strava.py")
-        _icons = _load_module("_saker_icons", _SAKER_DIR / "ui" / "icons.py")
-        _theme = _load_module("_saker_theme", _SAKER_DIR / "ui" / "theme.py")
-        _widgets = _load_module("_saker_widgets", _SAKER_DIR / "ui" / "widgets.py")
-
-        generate_all_demo_data = _demo.generate_all_demo_data
-        generate_demo_activities = _demo.generate_demo_activities
-        generate_demo_nutrition = _demo.generate_demo_nutrition
-        generate_demo_weight = _demo.generate_demo_weight
-        is_demo_data = _demo.is_demo_data
-
-        strava_is_connected = _strava.is_connected
-        strava_auth_url = _strava.get_authorization_url
-        strava_exchange_code = _strava.exchange_code
-        strava_clear_tokens = _strava.clear_tokens
-        strava_load_tokens = _strava.load_tokens
-        strava_fetch_activities = _strava.fetch_activities
-        strava_get_athlete = _strava.get_athlete
-        activities_to_cardio_df = _strava.activities_to_cardio_df
-        activities_to_workouts_df = _strava.activities_to_workouts_df
-        get_best_run_efforts = _strava.get_best_run_efforts
-        get_fastest_run_routes = _strava.get_fastest_run_routes
-        enrich_activity_locations = _strava.enrich_activity_locations
-
-        get_icon = _icons.get_icon
-        apply_new_styles = _theme.apply_new_styles
-
-        render_custom_metric_card = _widgets.render_custom_metric_card
-        render_timeline_buttons = _widgets.render_timeline_buttons
-        render_fastest_run_map_section = _widgets.render_fastest_run_map_section
-        render_activity_start_map_section = _widgets.render_activity_start_map_section
+from data.demo_data import (
+    generate_all_demo_data,
+    generate_demo_activities,
+    generate_demo_nutrition,
+    generate_demo_weight,
+    is_demo_data,
+)
+from data.strava import (
+    is_connected as strava_is_connected,
+    get_authorization_url as strava_auth_url,
+    exchange_code as strava_exchange_code,
+    clear_tokens as strava_clear_tokens,
+    load_tokens as strava_load_tokens,
+    fetch_activities as strava_fetch_activities,
+    get_athlete as strava_get_athlete,
+    activities_to_cardio_df,
+    activities_to_workouts_df,
+    get_best_run_efforts,
+    get_fastest_run_routes,
+    enrich_activity_locations,
+)
+from ui.icons import get_icon
+from ui.theme import apply_new_styles
+from ui.widgets import (
+    render_custom_metric_card,
+    render_timeline_buttons,
+    render_fastest_run_map_section,
+    render_activity_start_map_section,
+)
 
 # =============================================================================
 # PAGE CONFIG (MUST be first Streamlit command)
@@ -209,40 +122,11 @@ def _show_chart(fig, **kwargs):
 try:
     _STRAVA_CLIENT_ID = st.secrets["STRAVA_CLIENT_ID"]
     _STRAVA_CLIENT_SECRET = st.secrets["STRAVA_CLIENT_SECRET"]
+    _STRAVA_REDIRECT_URI = st.secrets.get("STRAVA_REDIRECT_URI", "https://sakerpro.streamlit.app/")
 except Exception:
     _STRAVA_CLIENT_ID = ""
     _STRAVA_CLIENT_SECRET = ""
-
-def _get_strava_redirect_uri() -> str:
-    """Return the redirect URI used for Strava OAuth.
-
-    If this is wrong, Strava will redirect you to the wrong app URL after login,
-    which can look like a 403/access-denied page.
-
-    Priority:
-    1) `st.secrets["STRAVA_REDIRECT_URI"]`
-    2) env var `STRAVA_REDIRECT_URI`
-    3) local default: `http://localhost:<streamlit-port>/`
-    """
-    try:
-        v = (st.secrets.get("STRAVA_REDIRECT_URI") or "").strip()
-        if v:
-            return v
-    except Exception:
-        pass
-
-    v = (os.environ.get("STRAVA_REDIRECT_URI") or "").strip()
-    if v:
-        return v
-
-    try:
-        port = int(st.get_option("server.port") or 8501)
-    except Exception:
-        port = 8501
-    return f"http://localhost:{port}/"
-
-
-_STRAVA_REDIRECT_URI = _get_strava_redirect_uri()
+    _STRAVA_REDIRECT_URI = "https://sakerpro.streamlit.app/"
 
 
 @st.cache_data(show_spinner="Syncing Strava…", ttl=900)
@@ -754,32 +638,14 @@ def render_dashboard(workouts_df, activities_df, nutrition_df, weight_df, using_
                 _mono_parts.append(_mono_lift)
             _last_28_cardio = _filter_by_range(_raw_activities, "1M")
             if not _last_28_cardio.empty:
-                # Weight modalities so walk-only days don't erase "rest days".
-                _factors = {
-                    "Running": 1.0,
-                    "Cycling": 0.7,
-                    "Swimming": 0.8,
-                    "Walking": 0.2,
-                    "Hiking": 0.35,
-                }
-                _c = _last_28_cardio.copy()
-                if "activity_type" in _c.columns:
-                    _c["_factor"] = _c["activity_type"].map(_factors).fillna(0.5)
-                else:
-                    _c["_factor"] = 0.5
-                _c["_weighted"] = _c["duration_min"] * _c["_factor"]
-                _mono_cardio = _c.groupby("date")["_weighted"].sum()
+                _mono_cardio = _last_28_cardio.groupby("date")["duration_min"].sum()
                 _mono_parts.append(_mono_cardio)
 
             if _mono_parts:
                 _mono_combined = _mono_parts[0]
                 for _mp in _mono_parts[1:]:
                     _mono_combined = _mono_combined.add(_mp, fill_value=0)
-                # Use a full 28-day window so rest days (0 load) are represented.
-                _end = pd.Timestamp.today().normalize()
-                _start = _end - pd.Timedelta(days=27)
-                _idx = pd.date_range(_start, _end, freq="D")
-                _daily_loads = _mono_combined.sort_index().reindex(_idx, fill_value=0)
+                _daily_loads = _mono_combined.sort_index()
                 _mono_mean = _daily_loads.mean()
                 _mono_std = _daily_loads.std()
                 _monotony = round(_mono_mean / _mono_std, 2) if _mono_std > 0 else 0
@@ -825,12 +691,10 @@ def render_dashboard(workouts_df, activities_df, nutrition_df, weight_df, using_
 
             # Data-driven explanation
             if _mono_parts:
-                # Treat very light days as rest/easy days for fairness.
-                _active_threshold = 20
-                _active_days = int((_daily_loads >= _active_threshold).sum())
+                _active_days = int((_daily_loads > 0).sum())
                 _total_days = max(len(_daily_loads), 1)
                 _max_load = _daily_loads.max()
-                _min_load = _daily_loads[_daily_loads >= _active_threshold].min() if (_daily_loads >= _active_threshold).any() else 0
+                _min_load = _daily_loads[_daily_loads > 0].min() if (_daily_loads > 0).any() else 0
                 _rest_days = _total_days - _active_days
 
                 if _monotony >= 2.0:
@@ -1048,7 +912,6 @@ def render_dashboard(workouts_df, activities_df, nutrition_df, weight_df, using_
     # ── FASTEST RUN PRETTYMAP (Strava route overlay) ───────────────────
     render_fastest_run_map_section(
         st.session_state.get("strava_fastest_routes"),
-        st.session_state.get("strava_raw"),
         using_demo=using_demo,
         key_prefix="dashboard_fastest_route",
     )
@@ -1785,19 +1648,47 @@ def render_race_prep(workouts_df, activities_df):
 # =============================================================================
 
 def _handle_strava_callback():
-    """Process the Strava OAuth callback if an auth code is in the URL."""
+    """Process the Strava OAuth callback if an auth code is in the URL.
+
+    Must be called EARLY in main(), before page routing, because Strava
+    redirects to the root URL and the default page is Dashboard — not Settings.
+    """
     params = st.query_params
     code = params.get("code")
-    if code and not st.session_state.get("_strava_exchanged"):
-        if _STRAVA_CLIENT_ID and _STRAVA_CLIENT_SECRET:
-            try:
-                strava_exchange_code(_STRAVA_CLIENT_ID, _STRAVA_CLIENT_SECRET, code)
-                st.session_state["_strava_exchanged"] = True
-                # Clear the auth code from the URL
-                st.query_params.clear()
-                st.rerun()
-            except Exception as e:
-                st.error(f"Strava authorization failed: {e}")
+    if not code:
+        return
+
+    # Guard: Strava auth codes are single-use. If a rerun re-triggers this
+    # function with the same code, skip the exchange to avoid a 400 error.
+    if st.session_state.get("_strava_code_used") == code:
+        return
+
+    if not _STRAVA_CLIENT_ID or not _STRAVA_CLIENT_SECRET:
+        st.error("Strava OAuth callback received but API credentials are missing.")
+        return
+
+    # Debug breadcrumb (visible on Community Cloud logs)
+    import logging
+    logging.info("[Saker Strava OAuth] code=%s... redirect_uri=%s", code[:8], _STRAVA_REDIRECT_URI)
+
+    try:
+        st.session_state["_strava_code_used"] = code  # mark BEFORE exchange
+        strava_exchange_code(
+            _STRAVA_CLIENT_ID,
+            _STRAVA_CLIENT_SECRET,
+            code,
+            redirect_uri=_STRAVA_REDIRECT_URI,
+        )
+        st.session_state["_strava_exchanged"] = True
+        # Clear the auth code from the URL so it isn't reused on refresh
+        st.query_params.clear()
+        st.rerun()
+    except Exception as e:
+        st.session_state.pop("_strava_code_used", None)  # allow retry
+        st.error(f"Strava authorization failed: {e}")
+        # Show debug info so the user can report it
+        with st.expander("Debug details", expanded=False):
+            st.code(f"redirect_uri: {_STRAVA_REDIRECT_URI}\nclient_id: {_STRAVA_CLIENT_ID[:6]}...\ncode: {code[:12]}...\nerror: {e}")
 
 
 def _sync_strava():
@@ -1820,23 +1711,11 @@ def render_settings():
     """Settings page — Strava Connect and data status."""
     st.markdown(f"### {get_icon('settings', 'blue', 20)} Settings", unsafe_allow_html=True)
 
-    # Handle OAuth callback if redirected back from Strava
-    _handle_strava_callback()
+    # Callback is now handled in main() before page routing — no need here
 
     # --- Strava Connect ---
     st.markdown(f"#### {get_icon('strava', 'orange', 18)} Connect Strava", unsafe_allow_html=True)
     st.caption("Link your Strava account to pull real activity data into the dashboard.")
-
-    # Helpful diagnostics: Strava will redirect to this URL after login.
-    st.caption(f"Redirect URI: `{_STRAVA_REDIRECT_URI}`")
-    try:
-        from urllib.parse import urlparse
-
-        _domain = urlparse(_STRAVA_REDIRECT_URI).hostname
-        if _domain:
-            st.caption(f"Strava API setting → Authorization Callback Domain: `{_domain}`")
-    except Exception:
-        pass
 
     connected = strava_is_connected()
     has_credentials = bool(_STRAVA_CLIENT_ID and _STRAVA_CLIENT_SECRET)
@@ -1870,11 +1749,11 @@ def render_settings():
 
         col_sync, col_disconnect = st.columns(2)
         with col_sync:
-            if st.button(f"Sync Activities", key="strava_sync", type="primary", width="stretch"):
+            if st.button(f"Sync Activities", key="strava_sync", type="primary", use_container_width=True):
                 _sync_strava()
                 st.rerun()
         with col_disconnect:
-            if st.button("Disconnect Strava", key="strava_disconnect", type="secondary", width="stretch"):
+            if st.button("Disconnect Strava", key="strava_disconnect", type="secondary", use_container_width=True):
                 strava_clear_tokens()
                 for k in ("strava_activities_df", "strava_workouts_df",
                           "strava_best_runs", "strava_fastest_routes", "strava_raw", "_strava_exchanged"):
@@ -1900,33 +1779,6 @@ def render_settings():
             Connect with Strava
         </a>
         """, unsafe_allow_html=True)
-
-        with st.expander("Having trouble connecting? Use manual code exchange"):
-            st.caption(
-                "If browser redirects fail, authorize anyway, then copy the `code` "
-                "query parameter from the callback URL and paste it below."
-            )
-            st.markdown(
-                f"- Authorize URL: [{auth_url}]({auth_url})\n"
-                f"- Expected callback base: `{_STRAVA_REDIRECT_URI}`"
-            )
-            manual_code = st.text_input(
-                "Strava OAuth code",
-                key="strava_manual_code",
-                placeholder="Paste code from URL: ?state=...&code=HERE&scope=...",
-            ).strip()
-            if st.button("Exchange Code Manually", key="strava_manual_exchange", width="stretch"):
-                if not manual_code:
-                    st.warning("Paste the `code` value first.")
-                else:
-                    try:
-                        strava_exchange_code(_STRAVA_CLIENT_ID, _STRAVA_CLIENT_SECRET, manual_code)
-                        st.session_state["_strava_exchanged"] = True
-                        st.success("Strava connected. Syncing activities…")
-                        _sync_strava()
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Manual code exchange failed: {e}")
 
     # Show current data status
     st.markdown("---")
@@ -1963,7 +1815,7 @@ def render_settings():
     - **Weight:** Gradual trend with realistic daily variance
 
     Nutrition and weight data is always synthetic in this demo.
-    The full desktop version supports Garmin, Hevy, MacroFactor, and more.
+    The full desktop version supports Garmin, Apple Health, MacroFactor, and more.
     """)
 
     # --- About ---
@@ -1976,7 +1828,7 @@ def render_settings():
     dashboard and analytics capabilities. The full desktop version includes:
     - Local LLM coaching via llama.cpp (100% offline)
     - Periodised plan generation with calendar export
-    - Garmin / Hevy / MacroFactor integration
+    - Garmin / Apple Health / MacroFactor integration
     - Injury tracking with Physio-Bot
     - Advanced race preparation tools
     """)
@@ -1987,6 +1839,11 @@ def render_settings():
 # =============================================================================
 
 def main():
+    # Handle Strava OAuth callback FIRST — before sidebar/page routing.
+    # Strava redirects to the root URL, so this must run regardless of which
+    # page the sidebar would otherwise show.
+    _handle_strava_callback()
+
     page = _render_sidebar()
 
     # Load data
