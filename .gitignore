@@ -23,13 +23,16 @@ venv/
 *.swo
 
 # User Data (created at runtime)
-data/
-uploads/
-logs/
-plans/
-user_profile.yaml
-coach_state.json
-checkin_log.json
+/data/
+/uploads/
+/logs/
+/plans/
+/user_profile.yaml
+/coach_state.json
+/checkin_log.json
+
+# Allow package source folders
+!saker_pro_source/data/
 
 # PyInstaller
 *.spec.bak
