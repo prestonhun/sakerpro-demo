@@ -7,10 +7,7 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-try:
-    from ui.icons import get_icon
-except ModuleNotFoundError:  # Streamlit Cloud pathing
-    from saker_pro_source.ui.icons import get_icon
+from ui.icons import get_icon
 
 
 def _decode_polyline(polyline_str: str) -> list[tuple[float, float]]:
@@ -110,18 +107,17 @@ def _wallart_height(lat_span: float, lon_span: float) -> int:
 
 def render_fastest_run_map_section(
     fastest_routes: dict | None,
-    raw_activities: list[dict] | None,
     using_demo: bool,
     *,
     key_prefix: str = "dash_fastest_map",
 ):
-    """Dashboard section: Run routes (fastest vs all) with country filter."""
+    """Dashboard section: generate a 'PrettyMap' for the fastest run route."""
     with st.container(border=True):
         st.markdown(
             f"""
             <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
                 {get_icon('gps_fixed', 'blue', 18)}
-                <span style="font-weight:700;color:#e2e8f0;font-size:.95rem;">Run Routes</span>
+                <span style="font-weight:700;color:#e2e8f0;font-size:.95rem;">Fastest Run Route</span>
             </div>
             """,
             unsafe_allow_html=True,
@@ -143,295 +139,168 @@ def render_fastest_run_map_section(
             )
             return
 
-        if not raw_activities or not isinstance(raw_activities, list):
-            st.caption("Connect Strava in **Settings** to view your run routes.")
+        if not fastest_routes or not isinstance(fastest_routes, dict):
+            st.caption("Connect Strava in **Settings** to generate a PrettyMap from your fastest run.")
             return
 
-        # Countries with run route data
-        run_sports = {"Run", "VirtualRun", "TrailRun"}
-        run_acts = [
-            a for a in raw_activities
-            if isinstance(a, dict)
-            and (a.get("sport_type") or a.get("type", "")) in run_sports
-            and isinstance(a.get("map"), dict)
-            and bool(a.get("map", {}).get("summary_polyline"))
+        available = [k for k, v in fastest_routes.items() if v is not None and v.get("summary_polyline")]
+        if not available:
+            st.caption("No GPS routes found for your fastest runs (indoor/treadmill runs often have no route).")
+            return
+
+        sel_key = f"{key_prefix}_distance"
+        default_idx = 0
+        current = st.session_state.get(sel_key)
+        if current in available:
+            default_idx = available.index(current)
+
+        dist = st.selectbox(
+            "Select distance",
+            options=available,
+            index=default_idx,
+            key=sel_key,
+        )
+
+        run = fastest_routes.get(dist) or {}
+        poly = run.get("summary_polyline")
+        pts = _decode_polyline(poly)
+        if len(pts) < 2:
+            st.caption("Route polyline not available for that activity.")
+            return
+
+        lats = [p[0] for p in pts]
+        lons = [p[1] for p in pts]
+        min_lat, max_lat = min(lats), max(lats)
+        min_lon, max_lon = min(lons), max(lons)
+
+        # Pad bounds so the route doesn't get clipped by markers/title.
+        lat_span = max_lat - min_lat
+        lon_span = max_lon - min_lon
+        pad = 1.5
+        min_lat_p = min_lat - (lat_span * pad)
+        max_lat_p = max_lat + (lat_span * pad)
+        min_lon_p = min_lon - (lon_span * pad)
+        max_lon_p = max_lon + (lon_span * pad)
+
+        # If the route is essentially a point (very short activities), fall back to a sane pad.
+        if lat_span <= 1e-6:
+            min_lat_p, max_lat_p = min_lat - 0.002, max_lat + 0.002
+        if lon_span <= 1e-6:
+            min_lon_p, max_lon_p = min_lon - 0.002, max_lon + 0.002
+
+        center_lat = (min_lat_p + max_lat_p) / 2
+        center_lon = (min_lon_p + max_lon_p) / 2
+        # NOTE: We intentionally do not set mapbox.bounds here, because that
+        # prevents zooming out beyond the bounds (feels like zoom-out is disabled).
+        zoom = max(1, _auto_zoom(max_lat_p - min_lat_p, max_lon_p - min_lon_p) - 3)
+
+        elapsed_s = int(run.get("elapsed_time_s") or 0)
+        name = run.get("name") or "Run"
+
+        date_str = str(run.get("start_date_local") or "")[:10]
+        date_part = f" · {date_str}" if date_str else ""
+
+        dist_m = float(run.get("distance_m") or 0)
+        dist_mi = dist_m / 1609.344 if dist_m > 0 else 0.0
+        dist_part = f"{dist_mi:.2f} mi" if dist_mi else "--"
+
+        city = run.get("location_city") or ""
+        if isinstance(city, str):
+            city = city.strip()
+        if not city:
+            # Fall back to state/country if city isn't available
+            stt = run.get("location_state") or ""
+            ctry = run.get("location_country") or ""
+            city = " · ".join([p for p in [str(stt).strip(), str(ctry).strip()] if p])
+        city = city or "Unknown"
+
+        caption_lines = [
+            name or "Run",
+            f"{dist} · {dist_part}",
+            f"{date_str or '--'} · {city}",
+            f"Time: {_format_duration_hm(elapsed_s)}",
         ]
-        if not run_acts:
-            st.caption("No run routes found (GPS routes require outdoor runs with a recorded map).")
-            return
-
-        def _country_label(v: object) -> str:
-            s = v.strip() if isinstance(v, str) else ""
-            return _COUNTRY_NAME.get(s.upper(), s) if s else ""
-
-        countries = sorted({
-            _country_label(a.get("location_country")) for a in run_acts
-            if _country_label(a.get("location_country"))
-        })
-        if not countries:
-            st.caption("Run routes found, but no country labels yet. Use Settings → Resolve Activity Locations.")
-            return
-
-        mode_key = f"{key_prefix}_mode"
-        country_key = f"{key_prefix}_country"
-        mode = st.selectbox("Mode", options=["Fastest", "All"], key=mode_key)
-        country = st.selectbox("Country", options=countries, key=country_key)
-
-        # Filter runs by selected country
-        run_acts_country = [a for a in run_acts if _country_label(a.get("location_country")) == country]
-        if not run_acts_country:
-            st.caption("No run routes in that country.")
-            return
-
-        if mode == "Fastest":
-            if not fastest_routes or not isinstance(fastest_routes, dict):
-                st.caption("Sync Strava in **Settings** to compute fastest routes.")
-                return
-
-            # Only distances whose fastest activity is in this country
-            available = [
-                k for k, v in fastest_routes.items()
-                if v is not None
-                and v.get("summary_polyline")
-                and _country_label(v.get("location_country")) == country
-            ]
-            if not available:
-                st.caption("No fastest-run routes available for that country.")
-                return
-
-            sel_key = f"{key_prefix}_distance"
-            default_idx = 0
-            current = st.session_state.get(sel_key)
-            if current in available:
-                default_idx = available.index(current)
-
-            dist = st.selectbox("Distance", options=available, index=default_idx, key=sel_key)
-
-            run = fastest_routes.get(dist) or {}
-            poly = run.get("summary_polyline")
-            pts = _decode_polyline(poly)
-            if len(pts) < 2:
-                st.caption("Route polyline not available for that activity.")
-                return
-
-            lats = [p[0] for p in pts]
-            lons = [p[1] for p in pts]
-            min_lat, max_lat = min(lats), max(lats)
-            min_lon, max_lon = min(lons), max(lons)
-
-            lat_span = max_lat - min_lat
-            lon_span = max_lon - min_lon
-            pad = 1.5
-            min_lat_p = min_lat - (lat_span * pad)
-            max_lat_p = max_lat + (lat_span * pad)
-            min_lon_p = min_lon - (lon_span * pad)
-            max_lon_p = max_lon + (lon_span * pad)
-            if lat_span <= 1e-6:
-                min_lat_p, max_lat_p = min_lat - 0.002, max_lat + 0.002
-            if lon_span <= 1e-6:
-                min_lon_p, max_lon_p = min_lon - 0.002, max_lon + 0.002
-
-            center_lat = (min_lat_p + max_lat_p) / 2
-            center_lon = (min_lon_p + max_lon_p) / 2
-            zoom = max(1, _auto_zoom(max_lat_p - min_lat_p, max_lon_p - min_lon_p) - 3)
-
-            elapsed_s = int(run.get("elapsed_time_s") or 0)
-            name = run.get("name") or "Run"
-            date_str = str(run.get("start_date_local") or "")[:10]
-
-            dist_m = float(run.get("distance_m") or 0)
-            dist_mi = dist_m / 1609.344 if dist_m > 0 else 0.0
-            dist_part = f"{dist_mi:.2f} mi" if dist_mi else "--"
-
-            city = run.get("location_city") or ""
-            if isinstance(city, str):
-                city = city.strip()
-            state = (run.get("location_state") or "").strip() if isinstance(run.get("location_state"), str) else ""
-            if not city:
-                city = state
-            city = city or ""
-
-            caption_title = name
-            caption_meta = f"{dist} · {dist_part} · {date_str or '--'} · {city or country} · {_format_duration_hm(elapsed_s)}"
-
-            fig = go.Figure()
-            fig.add_trace(
-                go.Scattermapbox(
-                    lat=lats,
-                    lon=lons,
-                    mode="lines",
-                    line=dict(color="rgba(37,140,244,0.25)", width=10),
-                    name="Glow",
-                    hoverinfo="skip",
-                )
-            )
-            fig.add_trace(
-                go.Scattermapbox(
-                    lat=lats,
-                    lon=lons,
-                    mode="lines",
-                    line=dict(color="#258cf4", width=4),
-                    name="Route",
-                    hoverinfo="skip",
-                )
-            )
-            fig.update_layout(
-                template="plotly_dark",
-                paper_bgcolor="rgba(0,0,0,0)",
-                plot_bgcolor="rgba(0,0,0,0)",
-                margin=dict(l=0, r=0, t=10, b=0),
-                showlegend=False,
-                uirevision=key_prefix,
-                height=_wallart_height(max_lat_p - min_lat_p, max_lon_p - min_lon_p),
-                mapbox=dict(
-                    style="carto-darkmatter",
-                    center=dict(lat=center_lat, lon=center_lon),
-                    zoom=zoom,
-                ),
-            )
-            fig.add_annotation(
-                xref="paper",
-                yref="paper",
-                x=0.5,
-                y=0.07,
-                xanchor="center",
-                yanchor="bottom",
-                align="center",
-                text=caption_title,
-                showarrow=False,
-                font=dict(size=26, color="#ffffff", family="Inter, sans-serif"),
-                bgcolor="rgba(15,23,42,0.55)",
-                borderwidth=0,
-            )
-            fig.add_annotation(
-                xref="paper",
-                yref="paper",
-                x=0.5,
-                y=0.025,
-                xanchor="center",
-                yanchor="bottom",
-                align="center",
-                text=caption_meta,
-                showarrow=False,
-                font=dict(size=15, color="#e2e8f0", family="Inter, sans-serif"),
-                bgcolor="rgba(15,23,42,0.55)",
-                borderwidth=0,
-            )
-            st.plotly_chart(fig, width="stretch", config=_map_config())
-            return
-
-        # mode == "All": aggregate all run routes for this country
-        all_pts: list[tuple[float, float]] = []
-        total_dist_m = 0.0
-        total_time_s = 0
-        n_acts = 0
-        decoded_routes: list[list[tuple[float, float]]] = []
-        for a in run_acts_country:
-            poly = a.get("map", {}).get("summary_polyline")
-            pts = _decode_polyline(poly)
-            if len(pts) < 2:
-                continue
-            decoded_routes.append(pts)
-            all_pts.extend(pts)
-            total_dist_m += float(a.get("distance") or 0)
-            total_time_s += int(a.get("elapsed_time") or 0)
-            n_acts += 1
-
-        if len(all_pts) < 2:
-            st.caption("No drawable run routes for that country.")
-            return
-
-        # Overlap counts by rounded coordinate (local repetition proxy)
-        counts: dict[tuple[float, float], int] = {}
-        for lat, lon in all_pts:
-            key = (round(lat, 4), round(lon, 4))
-            counts[key] = counts.get(key, 0) + 1
-
-        min_lat, max_lat = min(p[0] for p in all_pts), max(p[0] for p in all_pts)
-        min_lon, max_lon = min(p[1] for p in all_pts), max(p[1] for p in all_pts)
-        center_lat = (min_lat + max_lat) / 2
-        center_lon = (min_lon + max_lon) / 2
-        zoom = max(1, _auto_zoom(max_lat - min_lat, max_lon - min_lon) - 1)
-
-        total_mi = total_dist_m / 1609.344 if total_dist_m > 0 else 0.0
-        caption = f"Total Distance: {total_mi:,.1f}mi  Total Time: {_format_duration_hm(total_time_s)}  {n_acts} Activities"
+        caption_html = "<br>".join(caption_lines)
 
         fig = go.Figure()
-        # Draw ONLY route lines; darker where repeated.
-        # Implementation: segment the polylines and bucket segments by repetition
-        # count, then draw bucketed line segments as same-hue blue with higher alpha.
-        bins = [
-            (1, 1, 0.18),
-            (2, 3, 0.28),
-            (4, 7, 0.42),
-            (8, 15, 0.62),
-            (16, 10**9, 0.92),
-        ]
-        seg_lats: list[list[float | None]] = [[] for _ in bins]
-        seg_lons: list[list[float | None]] = [[] for _ in bins]
-
-        def _bin_idx(c: float) -> int:
-            for idx, (lo, hi, _a) in enumerate(bins):
-                if lo <= c <= hi:
-                    return idx
-            return len(bins) - 1
-
-        for pts in decoded_routes:
-            for i in range(len(pts) - 1):
-                lat1, lon1 = pts[i]
-                lat2, lon2 = pts[i + 1]
-                c1 = counts.get((round(lat1, 4), round(lon1, 4)), 1)
-                c2 = counts.get((round(lat2, 4), round(lon2, 4)), 1)
-                c = (c1 + c2) / 2
-                bi = _bin_idx(c)
-                seg_lats[bi].extend([lat1, lat2, None])
-                seg_lons[bi].extend([lon1, lon2, None])
-
-        # Draw light → dark so darker repetitions sit on top.
-        for (lo, hi, alpha), lats, lons in zip(bins, seg_lats, seg_lons):
-            if len(lats) < 2:
-                continue
-            fig.add_trace(
-                go.Scattermapbox(
-                    lat=lats,
-                    lon=lons,
-                    mode="lines",
-                    line=dict(color=f"rgba(37,140,244,{alpha})", width=3),
-                    hoverinfo="skip",
-                    name=f"{lo}-{hi}",
-                    showlegend=False,
-                )
+        # Soft glow underlay for a cleaner 'pretty map' look.
+        fig.add_trace(
+            go.Scattermapbox(
+                lat=lats,
+                lon=lons,
+                mode="lines",
+                line=dict(color="rgba(37,140,244,0.25)", width=10),
+                name="Glow",
+                hoverinfo="skip",
             )
+        )
+        fig.add_trace(
+            go.Scattermapbox(
+                lat=lats,
+                lon=lons,
+                mode="lines",
+                line=dict(color="#258cf4", width=4),
+                name="Route",
+                hoverinfo="skip",
+            )
+        )
+        fig.add_trace(
+            go.Scattermapbox(
+                lat=[lats[0]],
+                lon=[lons[0]],
+                mode="markers",
+                marker=dict(size=10, color="#0bda5b"),
+                name="Start",
+                hovertemplate="Start<extra></extra>",
+            )
+        )
+        fig.add_trace(
+            go.Scattermapbox(
+                lat=[lats[-1]],
+                lon=[lons[-1]],
+                mode="markers",
+                marker=dict(size=10, color="#ef4444"),
+                name="End",
+                hovertemplate="End<extra></extra>",
+            )
+        )
+
         fig.update_layout(
             template="plotly_dark",
             paper_bgcolor="rgba(0,0,0,0)",
             plot_bgcolor="rgba(0,0,0,0)",
-            margin=dict(l=0, r=0, t=10, b=0),
+            margin=dict(l=0, r=0, t=62, b=0),
             showlegend=False,
             uirevision=key_prefix,
-            height=_wallart_height(max_lat - min_lat, max_lon - min_lon),
+            height=_wallart_height(max_lat_p - min_lat_p, max_lon_p - min_lon_p),
             mapbox=dict(
                 style="carto-darkmatter",
                 center=dict(lat=center_lat, lon=center_lon),
                 zoom=zoom,
             ),
         )
+
         fig.add_annotation(
             xref="paper",
             yref="paper",
-            x=0.5,
-            y=0.03,
-            xanchor="center",
+            x=0.01,
+            y=0.02,
+            xanchor="left",
             yanchor="bottom",
-            align="center",
-            text=caption,
+            align="left",
+            text=(
+                "<span style='font-size:14px;font-weight:700;color:#e2e8f0;'>"
+                + caption_html
+                + "</span>"
+            ),
             showarrow=False,
-            font=dict(size=16, color="#e2e8f0", family="Inter, sans-serif"),
-            bgcolor="rgba(15,23,42,0.55)",
-            borderwidth=0,
+            bgcolor="rgba(15,23,42,0.65)",
+            bordercolor="rgba(255,255,255,0.12)",
+            borderwidth=1,
+            borderpad=10,
         )
+
         st.plotly_chart(fig, width="stretch", config=_map_config())
-        return
 
 
 _ACTIVITY_TYPE_MAP = {
@@ -443,22 +312,11 @@ _ACTIVITY_TYPE_MAP = {
     "GravelRide": "Cycling",
     "MountainBikeRide": "Cycling",
     "Walk": "Walking",
-    "NordicWalk": "Walking",
-    "TrailWalk": "Walking",
     "Hike": "Walking",
     "Swim": "Swimming",
-    "OpenWaterSwim": "Swimming",
     "WeightTraining": "Weights",
     "Crossfit": "Weights",
     "Workout": "Weights",
-}
-
-
-_COUNTRY_NAME = {
-    "US": "United States",
-    "USA": "United States",
-    "GB": "United Kingdom",
-    "UK": "United Kingdom",
 }
 
 
@@ -533,32 +391,13 @@ def render_activity_start_map_section(
 
         points: list[dict] = []
         us_state_counts: dict[str, int] = {}
-        kept_activities: list[dict] = []
         for act in raw_activities:
-            if not isinstance(act, dict):
-                continue
             start = act.get("start_latlng")
             if not (isinstance(start, (list, tuple)) and len(start) == 2):
                 continue
             lat, lon = start
             if lat is None or lon is None:
                 continue
-
-            # Require state+country; Strava often omits city. If city is missing,
-            # fall back to state for display/aggregation so miles aren't dropped.
-            city = act.get("location_city")
-            state = act.get("location_state")
-            country = act.get("location_country")
-            city_s = city.strip() if isinstance(city, str) else ""
-            state_s = state.strip() if isinstance(state, str) else ""
-            country_s = country.strip() if isinstance(country, str) else ""
-            if country_s:
-                country_s = _COUNTRY_NAME.get(country_s.upper(), country_s)
-            if not state_s or not country_s:
-                continue
-
-            if not city_s:
-                city_s = state_s
 
             sport = act.get("sport_type") or act.get("type", "")
             friendly = _ACTIVITY_TYPE_MAP.get(sport, str(sport) if sport else "Other")
@@ -592,7 +431,6 @@ def render_activity_start_map_section(
             time_str = _format_duration_hm(elapsed_s)
             pace_str = _format_pace_min_mile(elapsed_s, dist_m)
 
-            kept_activities.append(act)
             points.append({
                 "lat": float(lat),
                 "lon": float(lon),
@@ -602,13 +440,10 @@ def render_activity_start_map_section(
                 "time": time_str,
                 "pace": pace_str,
                 "name": act.get("name", ""),
-                "city": city_s,
-                "state": state_s,
-                "country": country_s,
             })
 
         if not points:
-            st.caption("No activities with complete location labels (city/state/country) were found.")
+            st.caption("No activities with GPS start locations found.")
             return
 
         # US State heatmap (if we have any state info)
@@ -734,59 +569,65 @@ def render_activity_start_map_section(
 
         # ── Mileage summaries by location ─────────────────────────────
         rows = []
-        for p in points:
-            if not p.get("distance_mi"):
+        for act in raw_activities:
+            if not isinstance(act, dict):
                 continue
-            city = str(p.get("city") or "").strip()
-            state = str(p.get("state") or "").strip()
-            country = str(p.get("country") or "").strip()
-            if city and state and city.lower() == state.lower():
-                place = f"{state}, {country}" if country else state
+            dist_m = float(act.get("distance") or 0)
+            if dist_m <= 0:
+                continue
+
+            sport = act.get("sport_type") or act.get("type", "")
+            friendly = _ACTIVITY_TYPE_MAP.get(sport, str(sport) if sport else "Other")
+
+            city_raw = (act.get("location_city") or "").strip() if isinstance(act.get("location_city"), str) else ""
+            state_raw = (act.get("location_state") or "").strip() if isinstance(act.get("location_state"), str) else ""
+            country_raw = (act.get("location_country") or "").strip() if isinstance(act.get("location_country"), str) else ""
+
+            # Build a composite location label: "City, State, Country"
+            # When city is missing, show "Other areas in State, Country"
+            if city_raw:
+                parts = [p for p in [city_raw, state_raw, country_raw] if p]
+                location = ", ".join(parts) if parts else "Unknown"
+            elif state_raw:
+                parts = [p for p in [state_raw, country_raw] if p]
+                location = "Other areas in " + ", ".join(parts)
+            elif country_raw:
+                location = "Other areas in " + country_raw
             else:
-                place = ", ".join([x for x in [city, state, country] if x])
+                location = "Unknown Location"
+
             rows.append({
-                "type": p["type"],
-                "miles": float(p["distance_mi"]),
-                "place": place,
+                "type": friendly,
+                "miles": dist_m / 1609.344,
+                "location": location,
+                "state": state_raw or "Unknown",
+                "country": country_raw or "Unknown",
             })
 
         if rows:
             df = pd.DataFrame(rows)
-            agg = (
-                df.groupby(["type", "place"], as_index=False)["miles"]
-                .sum()
-                .sort_values(["type", "miles"], ascending=[True, False])
-            )
 
-            verb = {
-                "Running": "Ran",
-                "Cycling": "Biked",
-                "Swimming": "Swam",
-                "Walking": "Walked",
-                "Hiking": "Hiked",
-                "Weights": "Trained",
-            }
-
-            type_order = ["Running", "Cycling", "Swimming", "Walking", "Hiking", "Weights", "Other"]
-            seen_types = [t for t in type_order if t in set(agg["type"].tolist())] + [
-                t for t in agg["type"].unique().tolist() if t not in type_order
-            ]
-
-            def _fmt_miles(x: float) -> str:
-                x1 = round(float(x), 1)
-                return str(int(x1)) if abs(x1 - int(x1)) < 1e-9 else f"{x1:.1f}"
+            def _summary_table(group_col: str) -> pd.DataFrame:
+                pv = df.pivot_table(
+                    index=group_col,
+                    columns="type",
+                    values="miles",
+                    aggfunc="sum",
+                    fill_value=0.0,
+                )
+                pv["Total"] = pv.sum(axis=1)
+                pv = pv.sort_values("Total", ascending=False)
+                # Keep it readable but still complete (scrollable)
+                return pv.round(1)
 
             st.markdown("##### Miles by Location")
-            for t in seen_types:
-                sub = agg[agg["type"] == t]
-                if sub.empty:
-                    continue
-                st.markdown(f"**{t}**")
-                lines = []
-                v = verb.get(t, "Did")
-                for _, r in sub.iterrows():
-                    lines.append(f"- {_fmt_miles(r['miles'])} Miles {v} in {r['place']}.")
-                st.markdown("\n".join(lines))
+            st.dataframe(_summary_table("location"), width="stretch", height=240)
+
+            st.markdown("##### Miles by State / Province")
+            st.dataframe(_summary_table("state"), width="stretch", height=240)
+
+            st.markdown("##### Miles by Country")
+            st.dataframe(_summary_table("country"), width="stretch", height=240)
 
 
 def render_timeline_buttons(key_prefix: str, current_value: str) -> str:
@@ -808,7 +649,7 @@ def render_timeline_buttons(key_prefix: str, current_value: str) -> str:
     for i, opt in enumerate(options):
         with cols[i]:
             btn_type = "primary" if current_value == opt else "secondary"
-            if st.button(opt, key=f"{key_prefix}_tl_{opt}", type=btn_type, width="stretch"):
+            if st.button(opt, key=f"{key_prefix}_tl_{opt}", type=btn_type, use_container_width=True):
                 selected = opt
     return selected
 

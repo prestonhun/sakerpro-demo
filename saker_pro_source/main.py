@@ -32,6 +32,7 @@ from data.demo_data import (
     is_demo_data,
 )
 from data.strava import (
+    set_session_state_store as _strava_set_store,
     is_connected as strava_is_connected,
     get_authorization_url as strava_auth_url,
     exchange_code as strava_exchange_code,
@@ -1921,6 +1922,15 @@ def render_settings():
 # =============================================================================
 
 def main():
+    # ── Wire Strava token storage to this user's session_state ─────────
+    # On Community Cloud every visitor shares the same filesystem.
+    # Storing tokens in session_state keeps each user's connection private.
+    _strava_set_store(
+        getter=lambda: st.session_state.get("_strava_tokens"),
+        setter=lambda t: st.session_state.__setitem__("_strava_tokens", t),
+        clearer=lambda: st.session_state.pop("_strava_tokens", None),
+    )
+
     # Handle Strava OAuth callback FIRST — before sidebar/page routing.
     # Strava redirects to the root URL, so this must run regardless of which
     # page the sidebar would otherwise show.

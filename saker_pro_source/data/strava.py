@@ -2,14 +2,22 @@
 """
 Strava API integration for Saker Pro.
 Handles OAuth2 authentication, token management, and activity fetching.
-All tokens stored locally in YAML — no cloud dependencies.
+
+Token storage
+-------------
+On Streamlit Community Cloud every visitor shares the same server filesystem.
+Tokens are therefore stored in ``st.session_state`` (per-browser-session) so
+one user's Strava connection never leaks to another visitor.
+
+The module exposes ``set_session_state_store(getter, setter, clearer)`` which
+main.py calls once at import time to wire the storage to Streamlit's session.
 """
 from __future__ import annotations
 
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import pandas as pd
 import requests
@@ -23,9 +31,30 @@ STRAVA_TOKEN_URL = "https://www.strava.com/oauth/token"
 STRAVA_API_BASE = "https://www.strava.com/api/v3"
 REQUIRED_SCOPES = "read,activity:read_all"
 
-_TOKEN_FILE = Path.home() / ".saker_pro" / "strava_tokens.yaml"
 _LOCATION_CACHE_FILE = Path.home() / ".saker_pro" / "strava_activity_locations.yaml"
 _GEOCODE_CACHE_FILE = Path.home() / ".saker_pro" / "geocode_cache.yaml"
+
+
+# ---------------------------------------------------------------------------
+# Session-state backed token storage
+# ---------------------------------------------------------------------------
+# These callables are replaced at runtime by main.py via
+# set_session_state_store() so that tokens live in st.session_state.
+_token_getter: Callable[[], dict | None] = lambda: None
+_token_setter: Callable[[dict], None] = lambda t: None
+_token_clearer: Callable[[], None] = lambda: None
+
+
+def set_session_state_store(
+    getter: Callable[[], dict | None],
+    setter: Callable[[dict], None],
+    clearer: Callable[[], None],
+) -> None:
+    """Wire token persistence to Streamlit session_state."""
+    global _token_getter, _token_setter, _token_clearer
+    _token_getter = getter
+    _token_setter = setter
+    _token_clearer = clearer
 
 
 # ---------------------------------------------------------------------------
@@ -33,7 +62,7 @@ _GEOCODE_CACHE_FILE = Path.home() / ".saker_pro" / "geocode_cache.yaml"
 # ---------------------------------------------------------------------------
 
 def _ensure_dir() -> None:
-    _TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _LOCATION_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
 
 
 def _load_location_cache() -> dict:
@@ -84,7 +113,7 @@ def _reverse_geocode_nominatim(lat: float, lon: float) -> dict:
             "format": "jsonv2",
             "lat": f"{lat:.7f}",
             "lon": f"{lon:.7f}",
-            "zoom": 10,
+            "zoom": 18,
             "addressdetails": 1,
         },
         headers={"User-Agent": "sakerpro-demo/1.0 (Streamlit; location enrichment)"},
@@ -96,7 +125,17 @@ def _reverse_geocode_nominatim(lat: float, lon: float) -> dict:
     if not isinstance(address, dict):
         address = {}
 
-    city = address.get("city") or address.get("town") or address.get("village") or address.get("hamlet")
+    # Try progressively less-specific fields for the city name.
+    city = (
+        address.get("city")
+        or address.get("town")
+        or address.get("village")
+        or address.get("hamlet")
+        or address.get("municipality")
+        or address.get("suburb")
+        or address.get("neighbourhood")
+        or address.get("county")  # last resort: county name
+    )
     state = address.get("state") or address.get("region")
     country = address.get("country")
     return {
@@ -106,9 +145,38 @@ def _reverse_geocode_nominatim(lat: float, lon: float) -> dict:
     }
 
 
+def _find_nearby_city(lat: float, lon: float, geo_cache: dict, radius: float = 0.03) -> str:
+    """Search the geocode cache for a nearby entry that has a city name.
+
+    Parameters
+    ----------
+    radius : float
+        Max difference in degrees (~3 km at mid-latitudes for 0.03).
+
+    Returns the city name if found, else empty string.
+    """
+    best_city = ""
+    best_dist = radius + 1
+    for key, val in geo_cache.items():
+        if not isinstance(val, dict):
+            continue
+        c = (val.get("city") or "").strip()
+        if not c:
+            continue
+        try:
+            parts = key.split(",")
+            klat, klon = float(parts[0]), float(parts[1])
+        except Exception:
+            continue
+        d = abs(klat - lat) + abs(klon - lon)  # Manhattan distance
+        if d < best_dist:
+            best_dist = d
+            best_city = c
+    return best_city if best_dist <= radius else ""
+
+
 def save_tokens(tokens: dict) -> None:
-    """Persist Strava OAuth tokens to local YAML file."""
-    _ensure_dir()
+    """Persist Strava OAuth tokens to session state."""
     athlete = tokens.get("athlete", {}) if isinstance(tokens.get("athlete"), dict) else {}
     payload = {
         "access_token": tokens["access_token"],
@@ -118,30 +186,24 @@ def save_tokens(tokens: dict) -> None:
         "athlete_firstname": athlete.get("firstname") or tokens.get("athlete_firstname", ""),
         "athlete_lastname": athlete.get("lastname") or tokens.get("athlete_lastname", ""),
     }
-    _TOKEN_FILE.write_text(yaml.dump(payload, default_flow_style=False))
+    _token_setter(payload)
 
 
 def load_tokens() -> dict | None:
-    """Load saved tokens, or return None if not connected."""
-    if not _TOKEN_FILE.exists():
-        return None
-    try:
-        data = yaml.safe_load(_TOKEN_FILE.read_text())
-        if data and "access_token" in data:
-            return data
-    except Exception:
-        pass
+    """Load saved tokens from session state, or return None if not connected."""
+    data = _token_getter()
+    if data and isinstance(data, dict) and "access_token" in data:
+        return data
     return None
 
 
 def clear_tokens() -> None:
     """Remove stored tokens (disconnect)."""
-    if _TOKEN_FILE.exists():
-        _TOKEN_FILE.unlink()
+    _token_clearer()
 
 
 def is_connected() -> bool:
-    """Check if valid Strava tokens exist."""
+    """Check if valid Strava tokens exist in this session."""
     return load_tokens() is not None
 
 
@@ -358,6 +420,25 @@ def enrich_activity_locations(
     geocode_used = 0
     geocode_changed = False
 
+    # ── One-time: re-geocode stale cache entries that have empty city ──
+    stale_keys = [
+        k for k, v in geo_cache.items()
+        if isinstance(v, dict) and not (v.get("city") or "").strip()
+    ]
+    regeocode_budget = min(len(stale_keys), max_geocode_lookups)
+    for sk in stale_keys[:regeocode_budget]:
+        try:
+            parts = sk.split(",")
+            slat, slon = float(parts[0]), float(parts[1])
+            time.sleep(1.05)
+            place = _reverse_geocode_nominatim(slat, slon)
+            if (place.get("city") or "").strip():
+                geo_cache[sk] = place
+                geocode_changed = True
+                geocode_used += 1
+        except Exception:
+            pass
+
     enriched: list[dict] = []
     for act in activities:
         if not isinstance(act, dict):
@@ -455,6 +536,18 @@ def enrich_activity_locations(
                     if not country and _norm_str(place.get("country")):
                         out["location_country"] = place.get("country")
                     geocode_used += 1
+            except Exception:
+                pass
+
+        # ── Nearby-city fallback: if city is still missing, borrow from a
+        # nearby cached coordinate that *does* have one. ──
+        city = _norm_str(out.get("location_city"))
+        if not city and has_latlng:
+            try:
+                lat, lon = float(start[0]), float(start[1])
+                nearby = _find_nearby_city(lat, lon, geo_cache)
+                if nearby:
+                    out["location_city"] = nearby
             except Exception:
                 pass
 
