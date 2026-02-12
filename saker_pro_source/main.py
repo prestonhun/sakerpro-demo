@@ -1901,6 +1901,33 @@ def render_settings():
         </a>
         """, unsafe_allow_html=True)
 
+        with st.expander("Having trouble connecting? Use manual code exchange"):
+            st.caption(
+                "If browser redirects fail, authorize anyway, then copy the `code` "
+                "query parameter from the callback URL and paste it below."
+            )
+            st.markdown(
+                f"- Authorize URL: [{auth_url}]({auth_url})\n"
+                f"- Expected callback base: `{_STRAVA_REDIRECT_URI}`"
+            )
+            manual_code = st.text_input(
+                "Strava OAuth code",
+                key="strava_manual_code",
+                placeholder="Paste code from URL: ?state=...&code=HERE&scope=...",
+            ).strip()
+            if st.button("Exchange Code Manually", key="strava_manual_exchange", width="stretch"):
+                if not manual_code:
+                    st.warning("Paste the `code` value first.")
+                else:
+                    try:
+                        strava_exchange_code(_STRAVA_CLIENT_ID, _STRAVA_CLIENT_SECRET, manual_code)
+                        st.session_state["_strava_exchanged"] = True
+                        st.success("Strava connected. Syncing activities…")
+                        _sync_strava()
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Manual code exchange failed: {e}")
+
     # Show current data status
     st.markdown("---")
     st.markdown(f"#### {get_icon('info', 'blue', 18)} Data Status", unsafe_allow_html=True)
