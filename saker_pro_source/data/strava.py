@@ -134,7 +134,7 @@ def _reverse_geocode_nominatim(lat: float, lon: float) -> dict:
         or address.get("municipality")
         or address.get("suburb")
         or address.get("neighbourhood")
-        or address.get("county")  # last resort: county name
+        or address.get("county")  # last resort — county name
     )
     state = address.get("state") or address.get("region")
     country = address.get("country")
@@ -145,13 +145,13 @@ def _reverse_geocode_nominatim(lat: float, lon: float) -> dict:
     }
 
 
-def _find_nearby_city(lat: float, lon: float, geo_cache: dict, radius: float = 0.03) -> str:
+def _find_nearby_city(lat: float, lon: float, geo_cache: dict, radius: float = 0.04) -> str:
     """Search the geocode cache for a nearby entry that has a city name.
 
     Parameters
     ----------
     radius : float
-        Max difference in degrees (~3 km at mid-latitudes for 0.03).
+        Max difference in degrees (~4 km at mid-latitudes for 0.04).
 
     Returns the city name if found, else empty string.
     """
@@ -396,7 +396,7 @@ def enrich_activity_locations(
     *,
     max_detail_lookups: int = 75,
     allow_external_geocode: bool = True,
-    max_geocode_lookups: int = 35,
+    max_geocode_lookups: int = 80,
     detail_sleep_s: float = 0.25,
 ) -> list[dict]:
     """Enrich activities with `location_city/state/country` using Strava-only data.
@@ -425,7 +425,7 @@ def enrich_activity_locations(
         k for k, v in geo_cache.items()
         if isinstance(v, dict) and not (v.get("city") or "").strip()
     ]
-    regeocode_budget = min(len(stale_keys), max_geocode_lookups)
+    regeocode_budget = min(len(stale_keys), 40)
     for sk in stale_keys[:regeocode_budget]:
         try:
             parts = sk.split(",")
@@ -435,7 +435,13 @@ def enrich_activity_locations(
             if (place.get("city") or "").strip():
                 geo_cache[sk] = place
                 geocode_changed = True
-                geocode_used += 1
+            else:
+                # Still no city — try nearby lookup
+                nearby = _find_nearby_city(slat, slon, geo_cache)
+                if nearby:
+                    place["city"] = nearby
+                    geo_cache[sk] = place
+                    geocode_changed = True
         except Exception:
             pass
 

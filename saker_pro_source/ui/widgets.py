@@ -567,8 +567,8 @@ def render_activity_start_map_section(
 
         st.plotly_chart(fig, width="stretch", config=_map_config())
 
-        # ── Mileage summaries by location ─────────────────────────────
-        rows = []
+        # ── Mileage summaries by location (list format) ────────────────
+        loc_rows: dict[str, dict[str, float]] = {}  # { "Running": { "City, State, Country": miles } }
         for act in raw_activities:
             if not isinstance(act, dict):
                 continue
@@ -584,50 +584,47 @@ def render_activity_start_map_section(
             country_raw = (act.get("location_country") or "").strip() if isinstance(act.get("location_country"), str) else ""
 
             # Build a composite location label: "City, State, Country"
-            # When city is missing, show "Other areas in State, Country"
             if city_raw:
                 parts = [p for p in [city_raw, state_raw, country_raw] if p]
-                location = ", ".join(parts) if parts else "Unknown"
+                location = ", ".join(parts)
             elif state_raw:
                 parts = [p for p in [state_raw, country_raw] if p]
-                location = "Other areas in " + ", ".join(parts)
+                location = ", ".join(parts)
             elif country_raw:
-                location = "Other areas in " + country_raw
+                location = country_raw
             else:
-                location = "Unknown Location"
+                continue  # skip activities with no location at all
 
-            rows.append({
-                "type": friendly,
-                "miles": dist_m / 1609.344,
-                "location": location,
-                "state": state_raw or "Unknown",
-                "country": country_raw or "Unknown",
-            })
+            if friendly not in loc_rows:
+                loc_rows[friendly] = {}
+            loc_rows[friendly][location] = loc_rows[friendly].get(location, 0.0) + (dist_m / 1609.344)
 
-        if rows:
-            df = pd.DataFrame(rows)
-
-            def _summary_table(group_col: str) -> pd.DataFrame:
-                pv = df.pivot_table(
-                    index=group_col,
-                    columns="type",
-                    values="miles",
-                    aggfunc="sum",
-                    fill_value=0.0,
+        if loc_rows:
+            _VERB_MAP = {
+                "Running": "Ran",
+                "Cycling": "Rode",
+                "Walking": "Walked",
+                "Swimming": "Swam",
+                "Hiking": "Hiked",
+                "Weights": "Lifted",
+            }
+            bullet_html_parts = []
+            for activity_type in sorted(loc_rows.keys()):
+                verb = _VERB_MAP.get(activity_type, activity_type)
+                locs = loc_rows[activity_type]
+                sorted_locs = sorted(locs.items(), key=lambda x: -x[1])
+                items = "".join(
+                    f"<li style='color:#cbd5e1;font-size:.85rem;margin-bottom:4px;'>"
+                    f"<b>{miles:.1f}</b> Miles {verb} in {place}.</li>"
+                    for place, miles in sorted_locs
                 )
-                pv["Total"] = pv.sum(axis=1)
-                pv = pv.sort_values("Total", ascending=False)
-                # Keep it readable but still complete (scrollable)
-                return pv.round(1)
-
-            st.markdown("##### Miles by Location")
-            st.dataframe(_summary_table("location"), width="stretch", height=240)
-
-            st.markdown("##### Miles by State / Province")
-            st.dataframe(_summary_table("state"), width="stretch", height=240)
-
-            st.markdown("##### Miles by Country")
-            st.dataframe(_summary_table("country"), width="stretch", height=240)
+                bullet_html_parts.append(
+                    f"<div style='margin-bottom:12px;'>"
+                    f"<div style='font-weight:700;color:#e2e8f0;font-size:.9rem;margin-bottom:4px;'>{activity_type}</div>"
+                    f"<ul style='margin:0 0 0 16px;padding:0;list-style:disc;'>{items}</ul>"
+                    f"</div>"
+                )
+            st.markdown("".join(bullet_html_parts), unsafe_allow_html=True)
 
 
 def render_timeline_buttons(key_prefix: str, current_value: str) -> str:
