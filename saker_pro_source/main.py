@@ -10,10 +10,15 @@ import base64
 import sys
 from pathlib import Path
 
-# Ensure saker_pro_source is on sys.path for local imports
+# Ensure imports work both locally and on Streamlit Community Cloud.
+# Cloud runs from the repo root, so we add both:
+# - repo root (so `saker_pro_source` is importable as a package)
+# - this file's directory (so `data.*` and `ui.*` absolute imports work)
 _SAKER_DIR = Path(__file__).parent.resolve()
-if str(_SAKER_DIR) not in sys.path:
-    sys.path.insert(0, str(_SAKER_DIR))
+_REPO_ROOT = _SAKER_DIR.parent
+for _p in (str(_REPO_ROOT), str(_SAKER_DIR)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 # --- Third Party ---
 import numpy as np

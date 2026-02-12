@@ -7,7 +7,10 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-from ui.icons import get_icon
+try:
+    from ui.icons import get_icon
+except ModuleNotFoundError:  # Streamlit Cloud pathing
+    from saker_pro_source.ui.icons import get_icon
 
 
 def _decode_polyline(polyline_str: str) -> list[tuple[float, float]]:
