@@ -1653,24 +1653,37 @@ def _handle_strava_callback():
 
     Must be called EARLY in main(), before page routing, because Strava
     redirects to the root URL and the default page is Dashboard — not Settings.
+
+    CRITICAL: The code is cleared from the URL *before* attempting the token
+    exchange.  If the exchange fails or the app crashes later, the code won't
+    persist in the URL and trigger a crash-restart redirect loop on Community
+    Cloud.
     """
+    import logging
+
     params = st.query_params
     code = params.get("code")
     if not code:
         return
 
-    # Guard: Strava auth codes are single-use. If a rerun re-triggers this
-    # function with the same code, skip the exchange to avoid a 400 error.
+    # ── Immediately strip the auth code from the URL ──────────────────
+    # Strava codes are single-use.  Leaving it in the URL risks a loop:
+    #   redirect → exchange/crash → session restart → code still in URL → repeat
+    st.query_params.clear()
+
+    # Guard: already processed this exact code in this session
     if st.session_state.get("_strava_code_used") == code:
+        logging.info("[Saker Strava OAuth] Duplicate code, skipping exchange.")
         return
 
     if not _STRAVA_CLIENT_ID or not _STRAVA_CLIENT_SECRET:
         st.error("Strava OAuth callback received but API credentials are missing.")
         return
 
-    # Debug breadcrumb (visible on Community Cloud logs)
-    import logging
-    logging.info("[Saker Strava OAuth] code=%s... redirect_uri=%s", code[:8], _STRAVA_REDIRECT_URI)
+    logging.info(
+        "[Saker Strava OAuth] Exchanging code=%s… redirect_uri=%s",
+        code[:8], _STRAVA_REDIRECT_URI,
+    )
 
     try:
         st.session_state["_strava_code_used"] = code  # mark BEFORE exchange
@@ -1681,15 +1694,18 @@ def _handle_strava_callback():
             redirect_uri=_STRAVA_REDIRECT_URI,
         )
         st.session_state["_strava_exchanged"] = True
-        # Clear the auth code from the URL so it isn't reused on refresh
-        st.query_params.clear()
+        logging.info("[Saker Strava OAuth] Token exchange succeeded.")
         st.rerun()
     except Exception as e:
-        st.session_state.pop("_strava_code_used", None)  # allow retry
+        logging.error("[Saker Strava OAuth] Token exchange failed: %s", e)
         st.error(f"Strava authorization failed: {e}")
-        # Show debug info so the user can report it
         with st.expander("Debug details", expanded=False):
-            st.code(f"redirect_uri: {_STRAVA_REDIRECT_URI}\nclient_id: {_STRAVA_CLIENT_ID[:6]}...\ncode: {code[:12]}...\nerror: {e}")
+            st.code(
+                f"redirect_uri: {_STRAVA_REDIRECT_URI}\n"
+                f"client_id:    {_STRAVA_CLIENT_ID[:6]}…\n"
+                f"code:         {code[:12]}…\n"
+                f"error:        {e}"
+            )
 
 
 def _sync_strava():
