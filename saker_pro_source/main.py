@@ -29,35 +29,68 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 # --- Local ---
-from data.demo_data import (
-    generate_all_demo_data,
-    generate_demo_activities,
-    generate_demo_nutrition,
-    generate_demo_weight,
-    is_demo_data,
-)
-from data.strava import (
-    is_connected as strava_is_connected,
-    get_authorization_url as strava_auth_url,
-    exchange_code as strava_exchange_code,
-    clear_tokens as strava_clear_tokens,
-    load_tokens as strava_load_tokens,
-    fetch_activities as strava_fetch_activities,
-    get_athlete as strava_get_athlete,
-    activities_to_cardio_df,
-    activities_to_workouts_df,
-    get_best_run_efforts,
-    get_fastest_run_routes,
-    enrich_activity_locations,
-)
-from ui.icons import get_icon
-from ui.theme import apply_new_styles
-from ui.widgets import (
-    render_custom_metric_card,
-    render_timeline_buttons,
-    render_fastest_run_map_section,
-    render_activity_start_map_section,
-)
+# Streamlit Cloud runs from repo root; local dev often runs from saker_pro_source/.
+# Support both import layouts.
+try:
+    from data.demo_data import (
+        generate_all_demo_data,
+        generate_demo_activities,
+        generate_demo_nutrition,
+        generate_demo_weight,
+        is_demo_data,
+    )
+    from data.strava import (
+        is_connected as strava_is_connected,
+        get_authorization_url as strava_auth_url,
+        exchange_code as strava_exchange_code,
+        clear_tokens as strava_clear_tokens,
+        load_tokens as strava_load_tokens,
+        fetch_activities as strava_fetch_activities,
+        get_athlete as strava_get_athlete,
+        activities_to_cardio_df,
+        activities_to_workouts_df,
+        get_best_run_efforts,
+        get_fastest_run_routes,
+        enrich_activity_locations,
+    )
+    from ui.icons import get_icon
+    from ui.theme import apply_new_styles
+    from ui.widgets import (
+        render_custom_metric_card,
+        render_timeline_buttons,
+        render_fastest_run_map_section,
+        render_activity_start_map_section,
+    )
+except ModuleNotFoundError:
+    from saker_pro_source.data.demo_data import (
+        generate_all_demo_data,
+        generate_demo_activities,
+        generate_demo_nutrition,
+        generate_demo_weight,
+        is_demo_data,
+    )
+    from saker_pro_source.data.strava import (
+        is_connected as strava_is_connected,
+        get_authorization_url as strava_auth_url,
+        exchange_code as strava_exchange_code,
+        clear_tokens as strava_clear_tokens,
+        load_tokens as strava_load_tokens,
+        fetch_activities as strava_fetch_activities,
+        get_athlete as strava_get_athlete,
+        activities_to_cardio_df,
+        activities_to_workouts_df,
+        get_best_run_efforts,
+        get_fastest_run_routes,
+        enrich_activity_locations,
+    )
+    from saker_pro_source.ui.icons import get_icon
+    from saker_pro_source.ui.theme import apply_new_styles
+    from saker_pro_source.ui.widgets import (
+        render_custom_metric_card,
+        render_timeline_buttons,
+        render_fastest_run_map_section,
+        render_activity_start_map_section,
+    )
 
 # =============================================================================
 # PAGE CONFIG (MUST be first Streamlit command)
