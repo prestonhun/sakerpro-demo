@@ -7,6 +7,7 @@ Supports Strava Connect for real activity data; other sources use demo data.
 """
 
 import base64
+import os
 import sys
 from pathlib import Path
 import importlib.util
@@ -212,7 +213,36 @@ except Exception:
     _STRAVA_CLIENT_ID = ""
     _STRAVA_CLIENT_SECRET = ""
 
-_STRAVA_REDIRECT_URI = "https://sakerpro.streamlit.app/"
+def _get_strava_redirect_uri() -> str:
+    """Return the redirect URI used for Strava OAuth.
+
+    If this is wrong, Strava will redirect you to the wrong app URL after login,
+    which can look like a 403/access-denied page.
+
+    Priority:
+    1) `st.secrets["STRAVA_REDIRECT_URI"]`
+    2) env var `STRAVA_REDIRECT_URI`
+    3) local default: `http://localhost:<streamlit-port>/`
+    """
+    try:
+        v = (st.secrets.get("STRAVA_REDIRECT_URI") or "").strip()
+        if v:
+            return v
+    except Exception:
+        pass
+
+    v = (os.environ.get("STRAVA_REDIRECT_URI") or "").strip()
+    if v:
+        return v
+
+    try:
+        port = int(st.get_option("server.port") or 8501)
+    except Exception:
+        port = 8501
+    return f"http://localhost:{port}/"
+
+
+_STRAVA_REDIRECT_URI = _get_strava_redirect_uri()
 
 
 @st.cache_data(show_spinner="Syncing Strava…", ttl=900)
@@ -1796,6 +1826,17 @@ def render_settings():
     # --- Strava Connect ---
     st.markdown(f"#### {get_icon('strava', 'orange', 18)} Connect Strava", unsafe_allow_html=True)
     st.caption("Link your Strava account to pull real activity data into the dashboard.")
+
+    # Helpful diagnostics: Strava will redirect to this URL after login.
+    st.caption(f"Redirect URI: `{_STRAVA_REDIRECT_URI}`")
+    try:
+        from urllib.parse import urlparse
+
+        _domain = urlparse(_STRAVA_REDIRECT_URI).hostname
+        if _domain:
+            st.caption(f"Strava API setting → Authorization Callback Domain: `{_domain}`")
+    except Exception:
+        pass
 
     connected = strava_is_connected()
     has_credentials = bool(_STRAVA_CLIENT_ID and _STRAVA_CLIENT_SECRET)

@@ -34,6 +34,12 @@ _GEOCODE_CACHE_FILE = Path.home() / ".saker_pro" / "geocode_cache.yaml"
 
 def _ensure_dir() -> None:
     _TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+    # Best-effort hardening for local token/cache storage.
+    # (No-op on platforms/filesystems that don't support chmod.)
+    try:
+        _TOKEN_FILE.parent.chmod(0o700)
+    except Exception:
+        pass
 
 
 def _load_location_cache() -> dict:
@@ -50,6 +56,10 @@ def _save_location_cache(cache: dict) -> None:
     _ensure_dir()
     try:
         _LOCATION_CACHE_FILE.write_text(yaml.dump(cache, default_flow_style=False))
+        try:
+            _LOCATION_CACHE_FILE.chmod(0o600)
+        except Exception:
+            pass
     except Exception:
         pass
 
@@ -68,6 +78,10 @@ def _save_geocode_cache(cache: dict) -> None:
     _ensure_dir()
     try:
         _GEOCODE_CACHE_FILE.write_text(yaml.dump(cache, default_flow_style=False))
+        try:
+            _GEOCODE_CACHE_FILE.chmod(0o600)
+        except Exception:
+            pass
     except Exception:
         pass
 
@@ -138,6 +152,10 @@ def save_tokens(tokens: dict) -> None:
         "athlete_lastname": athlete.get("lastname") or tokens.get("athlete_lastname", ""),
     }
     _TOKEN_FILE.write_text(yaml.dump(payload, default_flow_style=False))
+    try:
+        _TOKEN_FILE.chmod(0o600)
+    except Exception:
+        pass
 
 
 def load_tokens() -> dict | None:
@@ -333,14 +351,19 @@ def enrich_activity_locations(
     max_geocode_lookups: int = 35,
     detail_sleep_s: float = 0.25,
 ) -> list[dict]:
-    """Enrich activities with `location_city/state/country` using Strava-only data.
+        """Enrich activities with `location_city/state/country`.
 
-    Streamlit Community Cloud friendly:
-    - avoids SciPy/GEOS heavy dependencies
-    - avoids third-party geocoding services
+        Streamlit Community Cloud friendly:
+        - avoids SciPy/GEOS heavy dependencies
+        - uses local YAML caches (under `~/.saker_pro/`)
 
-    Uses the activity detail endpoint as a fallback and caches results locally.
-    """
+        Strategy:
+        - prefers location fields already present in Strava activity summaries
+        - optionally falls back to Strava activity detail endpoint (rate-limited + cached)
+        - optionally falls back to OSM Nominatim reverse geocoding when enabled
+            (`allow_external_geocode=True`), which sends approximate coordinates to a
+            third-party service.
+        """
     if not activities:
         return []
 
