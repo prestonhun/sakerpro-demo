@@ -16,9 +16,12 @@ from pathlib import Path
 # - this file's directory (so `data.*` and `ui.*` absolute imports work)
 _SAKER_DIR = Path(__file__).parent.resolve()
 _REPO_ROOT = _SAKER_DIR.parent
-for _p in (str(_REPO_ROOT), str(_SAKER_DIR)):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+# Keep repo root ahead of saker_pro_source/ so `import saker_pro_source...` works.
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+# Add saker_pro_source/ as a secondary import root for legacy `import data` / `import ui`.
+if str(_SAKER_DIR) not in sys.path:
+    sys.path.append(str(_SAKER_DIR))
 
 # --- Third Party ---
 import numpy as np
@@ -29,39 +32,9 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 # --- Local ---
-# Streamlit Cloud runs from repo root; local dev often runs from saker_pro_source/.
-# Support both import layouts.
+# Prefer package imports (works on Streamlit Cloud from repo root),
+# with fallback to legacy imports (works when running inside saker_pro_source/).
 try:
-    from data.demo_data import (
-        generate_all_demo_data,
-        generate_demo_activities,
-        generate_demo_nutrition,
-        generate_demo_weight,
-        is_demo_data,
-    )
-    from data.strava import (
-        is_connected as strava_is_connected,
-        get_authorization_url as strava_auth_url,
-        exchange_code as strava_exchange_code,
-        clear_tokens as strava_clear_tokens,
-        load_tokens as strava_load_tokens,
-        fetch_activities as strava_fetch_activities,
-        get_athlete as strava_get_athlete,
-        activities_to_cardio_df,
-        activities_to_workouts_df,
-        get_best_run_efforts,
-        get_fastest_run_routes,
-        enrich_activity_locations,
-    )
-    from ui.icons import get_icon
-    from ui.theme import apply_new_styles
-    from ui.widgets import (
-        render_custom_metric_card,
-        render_timeline_buttons,
-        render_fastest_run_map_section,
-        render_activity_start_map_section,
-    )
-except ModuleNotFoundError:
     from saker_pro_source.data.demo_data import (
         generate_all_demo_data,
         generate_demo_activities,
@@ -86,6 +59,36 @@ except ModuleNotFoundError:
     from saker_pro_source.ui.icons import get_icon
     from saker_pro_source.ui.theme import apply_new_styles
     from saker_pro_source.ui.widgets import (
+        render_custom_metric_card,
+        render_timeline_buttons,
+        render_fastest_run_map_section,
+        render_activity_start_map_section,
+    )
+except ModuleNotFoundError:
+    from data.demo_data import (
+        generate_all_demo_data,
+        generate_demo_activities,
+        generate_demo_nutrition,
+        generate_demo_weight,
+        is_demo_data,
+    )
+    from data.strava import (
+        is_connected as strava_is_connected,
+        get_authorization_url as strava_auth_url,
+        exchange_code as strava_exchange_code,
+        clear_tokens as strava_clear_tokens,
+        load_tokens as strava_load_tokens,
+        fetch_activities as strava_fetch_activities,
+        get_athlete as strava_get_athlete,
+        activities_to_cardio_df,
+        activities_to_workouts_df,
+        get_best_run_efforts,
+        get_fastest_run_routes,
+        enrich_activity_locations,
+    )
+    from ui.icons import get_icon
+    from ui.theme import apply_new_styles
+    from ui.widgets import (
         render_custom_metric_card,
         render_timeline_buttons,
         render_fastest_run_map_section,
