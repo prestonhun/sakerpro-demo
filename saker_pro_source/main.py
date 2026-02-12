@@ -212,7 +212,7 @@ except Exception:
     _STRAVA_CLIENT_ID = ""
     _STRAVA_CLIENT_SECRET = ""
 
-_STRAVA_REDIRECT_URI = "http://localhost:8502"
+_STRAVA_REDIRECT_URI = "https://sakerpro.streamlit.app/"
 
 
 @st.cache_data(show_spinner="Syncing Strava…", ttl=900)
