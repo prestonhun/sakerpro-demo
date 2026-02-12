@@ -3,7 +3,7 @@
 # =============================================================================
 """
 Simplified demo of the Saker Pro fitness coach.
-Supports Hevy CSV upload; all other data sources replaced with demo data.
+Supports Strava Connect for real activity data; other sources use demo data.
 """
 
 import base64
@@ -24,7 +24,6 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 # --- Local ---
-from data.data_loader import load_workouts
 from data.demo_data import (
     generate_all_demo_data,
     generate_demo_activities,
@@ -32,9 +31,28 @@ from data.demo_data import (
     generate_demo_weight,
     is_demo_data,
 )
+from data.strava import (
+    is_connected as strava_is_connected,
+    get_authorization_url as strava_auth_url,
+    exchange_code as strava_exchange_code,
+    clear_tokens as strava_clear_tokens,
+    load_tokens as strava_load_tokens,
+    fetch_activities as strava_fetch_activities,
+    get_athlete as strava_get_athlete,
+    activities_to_cardio_df,
+    activities_to_workouts_df,
+    get_best_run_efforts,
+    get_fastest_run_routes,
+    enrich_activity_locations,
+)
 from ui.icons import get_icon
 from ui.theme import apply_new_styles
-from ui.widgets import render_custom_metric_card, render_timeline_buttons
+from ui.widgets import (
+    render_custom_metric_card,
+    render_timeline_buttons,
+    render_fastest_run_map_section,
+    render_activity_start_map_section,
+)
 
 # =============================================================================
 # PAGE CONFIG (MUST be first Streamlit command)
@@ -60,36 +78,87 @@ _PLOTLY_LAYOUT = dict(
     font=dict(color="#94a3b8"),
     xaxis=dict(gridcolor="rgba(255,255,255,0.05)"),
     yaxis=dict(gridcolor="rgba(255,255,255,0.05)"),
+    hovermode="x unified",
+    hoverlabel=dict(
+        bgcolor="#1e293b",
+        bordercolor="rgba(255,255,255,0.1)",
+        font=dict(color="#e2e8f0"),
+    ),
+)
+
+
+_HOVER_LABEL = dict(
+    bgcolor="#1e293b",
+    bordercolor="rgba(255,255,255,0.1)",
+    font=dict(color="#e2e8f0"),
 )
 
 
 def _styled_chart(fig):
     """Apply Saker dark styling to a Plotly figure."""
     fig.update_layout(**_PLOTLY_LAYOUT)
+    fig.update_traces(hoverlabel=_HOVER_LABEL)
     return fig
+
+
+def _show_chart(fig, **kwargs):
+    """Apply dark hoverlabel to every trace and display the chart."""
+    # Layout-level hoverlabel is used by hovermode="x unified"
+    fig.update_layout(hoverlabel=dict(
+        bgcolor="#1e293b",
+        bordercolor="rgba(255,255,255,0.1)",
+        font=dict(color="#e2e8f0"),
+    ))
+    # Trace-level hoverlabel for hovermode="closest" charts
+    fig.update_traces(hoverlabel=_HOVER_LABEL)
+    st.plotly_chart(fig, **kwargs)
 
 
 # =============================================================================
 # DATA LOADING
 # =============================================================================
 
-@st.cache_data(show_spinner=False)
-def _load_hevy(file_bytes) -> pd.DataFrame:
-    """Parse uploaded Hevy CSV bytes."""
-    import io
-    return load_workouts(io.BytesIO(file_bytes))
+# Strava API credentials — loaded from .streamlit/secrets.toml (NEVER committed)
+try:
+    _STRAVA_CLIENT_ID = st.secrets["STRAVA_CLIENT_ID"]
+    _STRAVA_CLIENT_SECRET = st.secrets["STRAVA_CLIENT_SECRET"]
+except Exception:
+    _STRAVA_CLIENT_ID = ""
+    _STRAVA_CLIENT_SECRET = ""
+
+_STRAVA_REDIRECT_URI = "http://localhost:8502"
+
+
+@st.cache_data(show_spinner="Syncing Strava…", ttl=900)
+def _fetch_strava(client_id: str, client_secret: str):
+    """Fetch & normalise all Strava activities (cached 15 min)."""
+    raw = strava_fetch_activities(client_id, client_secret)
+    # IMPORTANT: keep Strava detail calls low to avoid rate-limiting.
+    # Location enrichment will improve over successive syncs via local caches.
+    raw = enrich_activity_locations(raw, client_id, client_secret, max_detail_lookups=10)
+    cardio_df = activities_to_cardio_df(raw)
+    workouts_df = activities_to_workouts_df(raw)
+    best_runs = get_best_run_efforts(raw)
+    fastest_routes = get_fastest_run_routes(raw)
+    return cardio_df, workouts_df, best_runs, fastest_routes, raw
 
 
 def _get_data():
     """
     Return (workouts_df, activities_df, nutrition_df, weight_df, using_demo).
-    Uses uploaded Hevy data if available, otherwise demo data.
+    Uses Strava data if connected, otherwise demo data.
     """
-    workouts_df = st.session_state.get("workouts_df")
-    if workouts_df is not None and not workouts_df.empty:
-        # Real Hevy data uploaded — fill other sources with demo
+    strava_activities = st.session_state.get("strava_activities_df")
+    strava_workouts = st.session_state.get("strava_workouts_df")
+
+    has_strava = strava_activities is not None and not strava_activities.empty
+    has_workouts = strava_workouts is not None and not strava_workouts.empty
+
+    if has_strava or has_workouts:
         demo = generate_all_demo_data()
-        return workouts_df, demo["activities"], demo["nutrition"], demo["weight"], False
+        act_df = strava_activities if has_strava else demo["activities"]
+        wdf = strava_workouts if has_workouts else demo["workouts"]
+        return wdf, act_df, demo["nutrition"], demo["weight"], False
 
     # Full demo mode
     demo = generate_all_demo_data()
@@ -191,14 +260,26 @@ def _render_sidebar():
         st.markdown('<div style="flex:1;"></div>', unsafe_allow_html=True)
 
         # === PILOT CARD (pinned to bottom via sidebar flex layout) ===
-        st.markdown("""
+        # === PILOT CARD (pinned to bottom via sidebar flex layout) ===
+        # Show Strava user name if connected, otherwise "Demo Pilot"
+        _strava_tokens = strava_load_tokens()
+        if _strava_tokens and _strava_tokens.get("athlete_firstname"):
+            _pilot_name = f"{_strava_tokens.get('athlete_firstname', '')} {_strava_tokens.get('athlete_lastname', '')}".strip()
+            _pilot_initials = (_strava_tokens.get("athlete_firstname", "S")[:1] + _strava_tokens.get("athlete_lastname", "P")[:1]).upper()
+            _pilot_sub = "Strava Connected"
+        else:
+            _pilot_name = "Demo Pilot"
+            _pilot_initials = "SP"
+            _pilot_sub = "Community Cloud"
+
+        st.markdown(f"""
         <style>
-            section[data-testid="stSidebar"] [data-testid="stSidebarContent"] {
+            section[data-testid="stSidebar"] [data-testid="stSidebarContent"] {{
                 display: flex !important;
                 flex-direction: column !important;
                 height: 100vh !important;
                 padding-bottom: 1rem !important;
-            }
+            }}
         </style>
         <div style="background:rgba(30,41,59,0.5);border:1px solid rgba(255,255,255,0.08);
                     border-radius:12px;padding:14px;display:flex;align-items:center;gap:12px;
@@ -207,11 +288,11 @@ def _render_sidebar():
                         background:linear-gradient(135deg,#258cf4,#1d72c4);
                         display:flex;align-items:center;justify-content:center;
                         font-weight:700;color:#fff;font-size:1rem;">
-                SP
+                {_pilot_initials}
             </div>
             <div>
-                <div style="color:#e2e8f0;font-weight:600;font-size:.85rem;">Demo Pilot</div>
-                <div style="color:#64748b;font-size:.7rem;">Community Cloud</div>
+                <div style="color:#e2e8f0;font-weight:600;font-size:.85rem;">{_pilot_name}</div>
+                <div style="color:#64748b;font-size:.7rem;">{_pilot_sub}</div>
             </div>
         </div>
         """, unsafe_allow_html=True)
@@ -228,9 +309,9 @@ def _filter_by_range(df: pd.DataFrame, timeline: str) -> pd.DataFrame:
     if df is None or df.empty or "date" not in df.columns:
         return df
     today = pd.Timestamp.today().normalize()
-    mapping = {"1W": 7, "1M": 30, "3M": 90, "6M": 180, "1Y": 365}
+    mapping = {"1W": 7, "1M": 30, "3M": 90, "6M": 180, "1Y": 365, "2Y": 730}
     days = mapping.get(timeline)
-    if days is None:
+    if days is None:  # "ALL"
         return df
     cutoff = today - pd.Timedelta(days=days)
     return df[df["date"] >= cutoff]
@@ -353,13 +434,37 @@ def _muscle_group(exercise_title: str) -> str:
 def render_dashboard(workouts_df, activities_df, nutrition_df, weight_df, using_demo):
     """Main dashboard with KPI cards, risk console, and overview charts."""
     if using_demo:
-        st.info("Viewing sample data. Upload your Hevy export in **Settings** to see your real stats.", icon="ℹ️")
+        st.info("Viewing sample data. Connect your Strava account in **Settings** to see your real stats.", icon="ℹ️")
 
-    # Pre-compute shared data
-    acwr = _compute_acwr(workouts_df)
-    cardio_acwr = _compute_cardio_acwr(activities_df)
-    last_7 = _filter_by_range(workouts_df, "1W")
-    last_28 = _filter_by_range(workouts_df, "1M")
+    # Keep unfiltered copies for ACWR / risk computations that need full 28-day windows
+    _raw_workouts = workouts_df
+    _raw_activities = activities_df
+
+    # Data Range selector (same component as Analytics)
+    _dash_tl_key = "dashboard_timeline"
+    if _dash_tl_key not in st.session_state:
+        st.session_state[_dash_tl_key] = "3M"
+    _dr_l, _dr_r = st.columns([2, 3])
+    with _dr_l:
+        st.markdown("##### Data Range")
+    with _dr_r:
+        _dash_sel = render_timeline_buttons("dashboard", st.session_state[_dash_tl_key])
+        if _dash_sel != st.session_state[_dash_tl_key]:
+            st.session_state[_dash_tl_key] = _dash_sel
+            st.rerun()
+
+    # Apply range filter to data used by charts
+    dash_tl = st.session_state[_dash_tl_key]
+    workouts_df = _filter_by_range(workouts_df, dash_tl)
+    activities_df = _filter_by_range(activities_df, dash_tl)
+    nutrition_df = _filter_by_range(nutrition_df, dash_tl)
+    weight_df = _filter_by_range(weight_df, dash_tl)
+
+    # Pre-compute shared data (ALWAYS from unfiltered data for correct 7/28 day windows)
+    acwr = _compute_acwr(_raw_workouts)
+    cardio_acwr = _compute_cardio_acwr(_raw_activities)
+    last_7 = _filter_by_range(_raw_workouts, "1W")
+    last_28 = _filter_by_range(_raw_workouts, "1M")
     avg_rpe = round(last_7["rpe"].mean(), 1) if (not last_7.empty and "rpe" in last_7.columns and last_7["rpe"].notna().any()) else None
     acwr_val = acwr["acwr"]
 
@@ -448,7 +553,9 @@ def render_dashboard(workouts_df, activities_df, nutrition_df, weight_df, using_
     with c2:
         render_custom_metric_card("activity", "green", "Cardio Status", cardio_display, f"ACWR {c_acwr_val:.2f} · {cardio_label}" if c_acwr_val else "No data", cardio_status)
     with c3:
-        render_custom_metric_card("food", "orange", "Diet Status", diet_display, f"{avg_cal:,} kcal avg · {diet_label}" if avg_cal else "No data", diet_status)
+        _diet_sub = f"{avg_cal:,} kcal avg · {diet_label}" if avg_cal else "No data"
+        _diet_sub = "Demo data · " + _diet_sub if avg_cal else "Demo data"
+        render_custom_metric_card("food", "orange", "Diet Status", diet_display, _diet_sub, diet_status)
 
     # ── RISK CONSOLE ───────────────────────────────────────────────────
     st.markdown(f"### {get_icon('zap', 'orange', 20)} Risk Console", unsafe_allow_html=True)
@@ -464,8 +571,8 @@ def render_dashboard(workouts_df, activities_df, nutrition_df, weight_df, using_
             </div>
             """, unsafe_allow_html=True)
 
-            # Leg interference gauge
-            leg_data = _compute_leg_interference(workouts_df, activities_df)
+            # Leg interference gauge (uses unfiltered recent data)
+            leg_data = _compute_leg_interference(_raw_workouts, _raw_activities)
             _li_score = leg_data["score"]
             _li_color = "#0bda5b" if _li_score < 30 else "#f59e0b" if _li_score < 60 else "#ef4444"
             _li_pct = min(100, _li_score)
@@ -524,8 +631,39 @@ def render_dashboard(workouts_df, activities_df, nutrition_df, weight_df, using_
             """, unsafe_allow_html=True)
 
             # Calculate monotony (std dev of daily loads)
+            # Combine lifting + cardio into unified daily load
+            _mono_parts = []
             if not last_28.empty:
-                _daily_loads = last_28.groupby("date")["tonnage_lbs"].sum()
+                _mono_lift = last_28.groupby("date")["tonnage_lbs"].sum() / 1000
+                _mono_parts.append(_mono_lift)
+            _last_28_cardio = _filter_by_range(_raw_activities, "1M")
+            if not _last_28_cardio.empty:
+                # Weight modalities so walk-only days don't erase "rest days".
+                _factors = {
+                    "Running": 1.0,
+                    "Cycling": 0.7,
+                    "Swimming": 0.8,
+                    "Walking": 0.2,
+                    "Hiking": 0.35,
+                }
+                _c = _last_28_cardio.copy()
+                if "activity_type" in _c.columns:
+                    _c["_factor"] = _c["activity_type"].map(_factors).fillna(0.5)
+                else:
+                    _c["_factor"] = 0.5
+                _c["_weighted"] = _c["duration_min"] * _c["_factor"]
+                _mono_cardio = _c.groupby("date")["_weighted"].sum()
+                _mono_parts.append(_mono_cardio)
+
+            if _mono_parts:
+                _mono_combined = _mono_parts[0]
+                for _mp in _mono_parts[1:]:
+                    _mono_combined = _mono_combined.add(_mp, fill_value=0)
+                # Use a full 28-day window so rest days (0 load) are represented.
+                _end = pd.Timestamp.today().normalize()
+                _start = _end - pd.Timedelta(days=27)
+                _idx = pd.date_range(_start, _end, freq="D")
+                _daily_loads = _mono_combined.sort_index().reindex(_idx, fill_value=0)
                 _mono_mean = _daily_loads.mean()
                 _mono_std = _daily_loads.std()
                 _monotony = round(_mono_mean / _mono_std, 2) if _mono_std > 0 else 0
@@ -569,136 +707,47 @@ def render_dashboard(workouts_df, activities_df, nutrition_df, weight_df, using_
             </div>
             """, unsafe_allow_html=True)
 
-            # Explanatory note
-            st.markdown("""
-            <div style="margin-top:10px;padding:8px 10px;background:rgba(30,41,59,0.3);border-left:3px solid #a78bfa;
-                        border-radius:0 6px 6px 0;font-size:.75rem;color:#94a3b8;line-height:1.5;">
-                <strong style="color:#e2e8f0;">What is this?</strong> Training monotony = avg daily load ÷
-                std deviation. Values <strong>&lt;1.5</strong> are healthy variation.
-                <strong>&gt;2.0</strong> means sessions are too uniform, raising overtraining and
-                illness risk. Vary intensity to keep monotony low.
-            </div>
-            """, unsafe_allow_html=True)
+            # Data-driven explanation
+            if _mono_parts:
+                # Treat very light days as rest/easy days for fairness.
+                _active_threshold = 20
+                _active_days = int((_daily_loads >= _active_threshold).sum())
+                _total_days = max(len(_daily_loads), 1)
+                _max_load = _daily_loads.max()
+                _min_load = _daily_loads[_daily_loads >= _active_threshold].min() if (_daily_loads >= _active_threshold).any() else 0
+                _rest_days = _total_days - _active_days
 
-    # ── PERFORMANCE ARCHITECTURE ────────────────────────────────────────
-    st.markdown(f"### {get_icon('trending_up', 'blue', 20)} Performance Architecture", unsafe_allow_html=True)
+                if _monotony >= 2.0:
+                    _advice = ("Your daily loads are too uniform — this raises overtraining and illness risk. "
+                               "Add an easy/rest day or vary intensity between hard and light sessions.")
+                elif _monotony >= 1.5:
+                    _advice = ("Load variation is borderline. Consider alternating a hard day with an easier one, "
+                               "or adding a complete rest day to increase spread.")
+                else:
+                    _advice = ("Good variation. Your mix of hard, easy, and rest days keeps monotony healthy. "
+                               "Maintain this pattern.")
 
-    with st.container(border=True):
-        st.markdown(f"""
-        <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;">
-            {get_icon('activity', 'blue', 18)}
-            <span style="font-weight:700;color:#e2e8f0;font-size:.95rem;">Fitness, Fatigue &amp; Form</span>
-        </div>
-        """, unsafe_allow_html=True)
-        st.caption("Chronic Training Load (CTL) builds fitness. Acute Training Load (ATL) tracks fatigue. The difference is your Form (TSB).")
-
-        if not workouts_df.empty:
-            # Compute CTL (42-day EMA), ATL (7-day EMA), TSB
-            daily = workouts_df.groupby("date")["tonnage_lbs"].sum().sort_index()
-            idx = pd.date_range(daily.index.min(), daily.index.max())
-            daily = daily.reindex(idx, fill_value=0)
-            ctl = daily.ewm(span=42).mean()
-            atl = daily.ewm(span=7).mean()
-            tsb = ctl - atl
-            pmc_df = pd.DataFrame({"Date": idx, "Fitness (CTL)": ctl.values, "Fatigue (ATL)": atl.values, "Form (TSB)": tsb.values})
-
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=pmc_df["Date"], y=pmc_df["Fitness (CTL)"], name="Fitness (CTL)",
-                                     line=dict(color="#258cf4", width=3)))
-            fig.add_trace(go.Scatter(x=pmc_df["Date"], y=pmc_df["Fatigue (ATL)"], name="Fatigue (ATL)",
-                                     line=dict(color="#ec4899", width=2, dash="dot")))
-            fig.add_trace(go.Bar(x=pmc_df["Date"], y=pmc_df["Form (TSB)"], name="Form (TSB)",
-                                 marker_color=[("#0bda5b" if v >= 0 else "#ef4444") for v in pmc_df["Form (TSB)"]],
-                                 opacity=0.5))
-            fig.update_layout(**_PLOTLY_LAYOUT, height=350, barmode="overlay",
-                              legend=dict(orientation="h", y=-0.12))
-            st.plotly_chart(fig)
-
-            # PMC summary metrics
-            _ctl_now = ctl.iloc[-1] if len(ctl) > 0 else 0
-            _atl_now = atl.iloc[-1] if len(atl) > 0 else 0
-            _tsb_now = _ctl_now - _atl_now
-            _tsb_label = "Fresh" if _tsb_now > 15 else "Recovered" if _tsb_now > 0 else "Balanced" if _tsb_now > -10 else "Deep Fatigue"
-            _tsb_color = "#0bda5b" if _tsb_now > 0 else "#f59e0b" if _tsb_now > -10 else "#ef4444"
-
-            m1, m2, m3, m4 = st.columns(4)
-            with m1:
-                st.metric("Fitness (CTL)", f"{_ctl_now:,.0f}")
-            with m2:
-                st.metric("Fatigue (ATL)", f"{_atl_now:,.0f}")
-            with m3:
-                st.metric("Form (TSB)", f"{_tsb_now:+,.0f}")
-            with m4:
                 st.markdown(f"""
-                <div style="text-align:center;padding:10px;">
-                    <div style="font-size:.75rem;color:#94a3b8;margin-bottom:4px;">STATUS</div>
-                    <div style="background:{_tsb_color}22;color:{_tsb_color};padding:6px 12px;
-                                border-radius:20px;font-weight:700;font-size:.85rem;">{_tsb_label}</div>
+                <div style="margin-top:10px;padding:8px 10px;background:rgba(30,41,59,0.3);border-left:3px solid #a78bfa;
+                            border-radius:0 6px 6px 0;font-size:.75rem;color:#94a3b8;line-height:1.6;">
+                    <strong style="color:#e2e8f0;">Your data (28 days):</strong>
+                    {_active_days} active days, {_rest_days} rest days.
+                    Heaviest session: <strong>{_max_load:,.0f}</strong>,
+                    lightest: <strong>{_min_load:,.0f}</strong>
+                    (range {_max_load - _min_load:,.0f}).<br>
+                    <strong style="color:{_mono_color};">{_advice}</strong>
                 </div>
                 """, unsafe_allow_html=True)
-        else:
-            st.caption("No workout data available for PMC.")
-
-    # ── TRAINING VOLUME ─────────────────────────────────────────────────
-    with st.container(border=True):
-        st.markdown(f"""
-        <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
-            {get_icon('chart', 'blue', 18)}
-            <span style="font-weight:700;color:#e2e8f0;font-size:.95rem;">Training Volume</span>
-        </div>
-        """, unsafe_allow_html=True)
-        st.caption("Weekly cardio duration by type (bars) with lifting tonnage trend (line).")
-
-        has_lifting = not workouts_df.empty
-        has_cardio = not activities_df.empty
-
-        if has_lifting or has_cardio:
-            fig = go.Figure()
-
-            # Cardio bars (by type, stacked)
-            if has_cardio:
-                cardio_weekly = activities_df.copy()
-                cardio_weekly["week"] = cardio_weekly["date"].dt.to_period("W").dt.start_time
-                for act_type, color in [("Running", "#0bda5b"), ("Cycling", "#a78bfa"), ("Walking", "#f59e0b")]:
-                    subset = cardio_weekly[cardio_weekly["activity_type"] == act_type]
-                    if not subset.empty:
-                        wk = subset.groupby("week")["duration_min"].sum().reset_index()
-                        wk.columns = ["Week", "Minutes"]
-                        fig.add_trace(go.Bar(
-                            x=wk["Week"], y=wk["Minutes"],
-                            name=f"{act_type} (min)", marker_color=color,
-                            yaxis="y",
-                        ))
-
-            # Lifting line
-            if has_lifting:
-                daily_ton = workouts_df.groupby("date")["tonnage_lbs"].sum().reset_index()
-                daily_ton["week"] = daily_ton["date"].dt.to_period("W").dt.start_time
-                weekly_lift = daily_ton.groupby("week")["tonnage_lbs"].sum().reset_index()
-                weekly_lift.columns = ["Week", "Tonnage"]
-                fig.add_trace(go.Scatter(
-                    x=weekly_lift["Week"], y=weekly_lift["Tonnage"],
-                    name="Lifting (lbs)", line=dict(color="#258cf4", width=3),
-                    mode="lines+markers", marker=dict(size=5, color="#258cf4"),
-                    yaxis="y2",
-                ))
-
-            fig.update_layout(
-                template="plotly_dark",
-                paper_bgcolor="rgba(0,0,0,0)",
-                plot_bgcolor="rgba(0,0,0,0)",
-                margin=dict(l=0, r=0, t=30, b=0),
-                font=dict(color="#94a3b8"),
-                height=380, barmode="stack",
-                xaxis=dict(gridcolor="rgba(255,255,255,0.05)"),
-                yaxis=dict(title="Cardio (min)", gridcolor="rgba(255,255,255,0.05)", side="left"),
-                yaxis2=dict(title="Tonnage (lbs)", overlaying="y", side="right",
-                            gridcolor="rgba(255,255,255,0.03)"),
-                legend=dict(orientation="h", y=-0.15),
-            )
-            st.plotly_chart(fig)
-        else:
-            st.caption("No training data available.")
+            else:
+                st.markdown("""
+                <div style="margin-top:10px;padding:8px 10px;background:rgba(30,41,59,0.3);border-left:3px solid #a78bfa;
+                            border-radius:0 6px 6px 0;font-size:.75rem;color:#94a3b8;line-height:1.5;">
+                    <strong style="color:#e2e8f0;">What is this?</strong> Training monotony = avg daily load ÷
+                    std deviation. Values <strong>&lt;1.5</strong> are healthy variation.
+                    <strong>&gt;2.0</strong> means sessions are too uniform, raising overtraining and
+                    illness risk. Vary intensity to keep monotony low.
+                </div>
+                """, unsafe_allow_html=True)
 
     # ── NUTRITION & BODY WEIGHT ─────────────────────────────────────────
     col_n, col_w = st.columns(2)
@@ -708,6 +757,7 @@ def render_dashboard(workouts_df, activities_df, nutrition_df, weight_df, using_
             <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
                 {get_icon('food', 'green', 18)}
                 <span style="font-weight:700;color:#e2e8f0;font-size:.95rem;">Nutrition Balance</span>
+                <span style="font-size:.65rem;color:#f59e0b;background:rgba(245,158,11,0.15);padding:2px 8px;border-radius:8px;margin-left:auto;">DEMO DATA</span>
             </div>
             """, unsafe_allow_html=True)
             if not nutrition_df.empty:
@@ -728,7 +778,7 @@ def render_dashboard(workouts_df, activities_df, nutrition_df, weight_df, using_
                                          line=dict(color="#bef264", width=2),
                                          fill="tozeroy", fillcolor="rgba(190,242,100,0.1)"))
                 fig.update_layout(**_PLOTLY_LAYOUT, height=280, showlegend=False)
-                st.plotly_chart(fig)
+                _show_chart(fig)
             else:
                 st.caption("No nutrition data.")
 
@@ -738,6 +788,7 @@ def render_dashboard(workouts_df, activities_df, nutrition_df, weight_df, using_
             <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
                 {get_icon('scale', 'blue', 18)}
                 <span style="font-weight:700;color:#e2e8f0;font-size:.95rem;">Body Weight</span>
+                <span style="font-size:.65rem;color:#f59e0b;background:rgba(245,158,11,0.15);padding:2px 8px;border-radius:8px;margin-left:auto;">DEMO DATA</span>
             </div>
             """, unsafe_allow_html=True)
             if not weight_df.empty:
@@ -766,7 +817,7 @@ def render_dashboard(workouts_df, activities_df, nutrition_df, weight_df, using_
                 fig.add_trace(go.Scatter(x=recent_w["date"], y=recent_w["trend"], name="7d Trend",
                                          line=dict(color="#258cf4", width=3)))
                 fig.update_layout(**_PLOTLY_LAYOUT, height=280, legend=dict(orientation="h", y=-0.15))
-                st.plotly_chart(fig)
+                _show_chart(fig)
             else:
                 st.caption("No weight data.")
 
@@ -779,13 +830,11 @@ def render_dashboard(workouts_df, activities_df, nutrition_df, weight_df, using_
         </div>
         """, unsafe_allow_html=True)
 
-        # Build combined ledger from workouts and activities (last 14 days)
+        # Build combined ledger from all activities in the selected data range
         ledger_rows = []
-        today = pd.Timestamp.today().normalize()
-        cutoff = today - pd.Timedelta(days=14)
 
         if not workouts_df.empty:
-            recent_w = workouts_df[workouts_df["date"] >= cutoff]
+            recent_w = workouts_df
             for d, grp in recent_w.groupby("date"):
                 tonnage = int(grp["tonnage_lbs"].sum())
                 n_sets = len(grp)
@@ -801,7 +850,7 @@ def render_dashboard(workouts_df, activities_df, nutrition_df, weight_df, using_
                 })
 
         if not activities_df.empty:
-            recent_a = activities_df[activities_df["date"] >= cutoff]
+            recent_a = activities_df
             for _, row in recent_a.iterrows():
                 atype = row.get("activity_type", "Cardio")
                 dist = row.get("distance_miles", 0)
@@ -821,7 +870,7 @@ def render_dashboard(workouts_df, activities_df, nutrition_df, weight_df, using_
             ledger_rows.sort(key=lambda r: r["date"], reverse=True)
             # Build HTML table
             rows_html = ""
-            for r in ledger_rows[:20]:
+            for r in ledger_rows:
                 date_str = r["date"].strftime("%b %d")
                 rows_html += f"""
                 <tr style="border-bottom:1px solid rgba(255,255,255,0.05);">
@@ -855,7 +904,7 @@ def render_dashboard(workouts_df, activities_df, nutrition_df, weight_df, using_
 
             st.markdown(f"""
             {key_html}
-            <div style="overflow-x:auto;border-radius:8px;">
+            <div style="overflow-x:auto;max-height:420px;overflow-y:auto;border-radius:8px;">
             <table style="width:100%;border-collapse:collapse;font-family:inherit;">
                 <thead>
                     <tr style="border-bottom:2px solid rgba(37,140,244,0.3);position:sticky;top:0;background:#0f172a;">
@@ -873,107 +922,20 @@ def render_dashboard(workouts_df, activities_df, nutrition_df, weight_df, using_
         else:
             st.caption("No recent activities.")
 
-    # ── MUSCLE BALANCE & CARDIO ZONES ──────────────────────────────────
-    sys_l, sys_r = st.columns(2)
+    # ── ACTIVITY MAP (start points) ────────────────────────────────────
+    render_activity_start_map_section(
+        st.session_state.get("strava_raw"),
+        using_demo=using_demo,
+        key_prefix="dashboard_activity_map",
+    )
 
-    with sys_l:
-        with st.container(border=True):
-            st.markdown(f"""
-            <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
-                {get_icon('dumbbell', 'teal', 18)}
-                <span style="font-weight:700;color:#e2e8f0;font-size:.95rem;">Muscle Balance</span>
-            </div>
-            """, unsafe_allow_html=True)
-            if not workouts_df.empty and "exercise_title" in workouts_df.columns:
-                w_copy = workouts_df.copy()
-                w_copy["muscle"] = w_copy["exercise_title"].apply(_muscle_group)
-                muscle_sets = w_copy.groupby("muscle").size().reset_index(name="Sets")
-                muscle_vol = w_copy.groupby("muscle")["tonnage_lbs"].sum().reset_index()
-                muscle_vol.columns = ["muscle", "Volume"]
-
-                # Build closed radar (repeat first point to close the shape)
-                _theta_labels = [f"{m} ({s})" for m, s in zip(muscle_sets["muscle"], muscle_sets["Sets"])]
-                _sets_r = muscle_sets["Sets"].tolist()
-                _theta_closed = _theta_labels + [_theta_labels[0]]
-                _sets_closed = _sets_r + [_sets_r[0]]
-
-                fig = go.Figure()
-                fig.add_trace(go.Scatterpolar(
-                    r=_sets_closed,
-                    theta=_theta_closed,
-                    fill="toself", name="Sets",
-                    line=dict(color="#6366f1"), fillcolor="rgba(99,102,241,0.15)",
-                ))
-                if not muscle_vol.empty:
-                    _max_sets = muscle_sets["Sets"].max() if muscle_sets["Sets"].max() > 0 else 1
-                    _max_vol = muscle_vol["Volume"].max() if muscle_vol["Volume"].max() > 0 else 1
-                    _norm_vol = (muscle_vol["Volume"] / _max_vol * _max_sets).tolist()
-                    _vol_closed = _norm_vol + [_norm_vol[0]]
-                    fig.add_trace(go.Scatterpolar(
-                        r=_vol_closed,
-                        theta=_theta_closed,
-                        fill="toself", name="Volume (scaled)",
-                        line=dict(color="#14b8a6"), fillcolor="rgba(20,184,166,0.1)",
-                    ))
-                fig.update_layout(**_PLOTLY_LAYOUT, height=350,
-                                  polar=dict(bgcolor="rgba(0,0,0,0)",
-                                             radialaxis=dict(visible=True, gridcolor="rgba(255,255,255,0.08)"),
-                                             angularaxis=dict(gridcolor="rgba(255,255,255,0.08)")),
-                                  legend=dict(orientation="h", y=-0.05))
-                st.plotly_chart(fig)
-            else:
-                st.caption("No workout data.")
-
-    with sys_r:
-        with st.container(border=True):
-            st.markdown(f"""
-            <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
-                {get_icon('heart', 'green', 18)}
-                <span style="font-weight:700;color:#e2e8f0;font-size:.95rem;">Cardio Zones</span>
-            </div>
-            """, unsafe_allow_html=True)
-            if not activities_df.empty and "avg_hr" in activities_df.columns:
-                def _hr_zone(hr):
-                    if hr < 130:
-                        return "Zone 1 (Recovery)"
-                    elif hr < 150:
-                        return "Zone 2 (Aerobic)"
-                    elif hr < 165:
-                        return "Zone 3 (Tempo)"
-                    elif hr < 180:
-                        return "Zone 4 (Threshold)"
-                    else:
-                        return "Zone 5 (VO2max)"
-
-                act_copy = activities_df.copy()
-                act_copy["zone"] = act_copy["avg_hr"].apply(_hr_zone)
-                zone_counts = act_copy.groupby("zone")["duration_min"].sum().reset_index()
-                zone_counts.columns = ["Zone", "Minutes"]
-
-                zone_colors = {
-                    "Zone 1 (Recovery)": "#94a3b8",
-                    "Zone 2 (Aerobic)": "#0bda5b",
-                    "Zone 3 (Tempo)": "#f59e0b",
-                    "Zone 4 (Threshold)": "#ef4444",
-                    "Zone 5 (VO2max)": "#ec4899",
-                }
-                colors = [zone_colors.get(z, "#258cf4") for z in zone_counts["Zone"]]
-
-                fig = go.Figure(data=[go.Pie(
-                    labels=zone_counts["Zone"], values=zone_counts["Minutes"],
-                    hole=0, textinfo="percent",
-                    textposition="inside",
-                    marker=dict(colors=colors),
-                    textfont=dict(size=13, color="#ffffff"),
-                    insidetextorientation="horizontal",
-                )])
-                fig.update_layout(**_PLOTLY_LAYOUT, height=380,
-                                  showlegend=True,
-                                  legend=dict(orientation="h", y=-0.1,
-                                              font=dict(size=11, color="#e2e8f0")))
-                st.plotly_chart(fig)
-            else:
-                st.caption("No HR data available.")
+    # ── FASTEST RUN PRETTYMAP (Strava route overlay) ───────────────────
+    render_fastest_run_map_section(
+        st.session_state.get("strava_fastest_routes"),
+        st.session_state.get("strava_raw"),
+        using_demo=using_demo,
+        key_prefix="dashboard_fastest_route",
+    )
 
 
 # =============================================================================
@@ -985,7 +947,7 @@ def render_analytics(workouts_df, activities_df, nutrition_df, weight_df, using_
     st.markdown(f"### {get_icon('chart', 'blue', 20)} Analytics", unsafe_allow_html=True)
 
     if using_demo:
-        st.info("Viewing sample data. Upload your Hevy export in **Settings**.", icon="ℹ️")
+        st.info("Viewing sample data. Connect Strava in **Settings** to see real data.", icon="ℹ️")
 
     # Timeline filter
     tl_key = "analytics_timeline"
@@ -1005,70 +967,170 @@ def render_analytics(workouts_df, activities_df, nutrition_df, weight_df, using_
     w_filtered = _filter_by_range(workouts_df, selected_tl)
     a_filtered = _filter_by_range(activities_df, selected_tl)
 
-    # ── LIFTING VOLUME (Line) ────────────────────────────────────────────
+    # ── TRAINING VOLUME (unified) ────────────────────────────────────────
     with st.container(border=True):
-        st.markdown(f"""
-        <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
-            {get_icon('trending_up', 'blue', 18)}
-            <span style="font-weight:700;color:#e2e8f0;font-size:.95rem;">Lifting Volume Over Time</span>
-        </div>
-        """, unsafe_allow_html=True)
-        if not w_filtered.empty:
-            daily_vol = w_filtered.groupby("date")["tonnage_lbs"].sum().reset_index()
-            daily_vol.columns = ["Date", "Volume (lbs)"]
-            daily_vol = daily_vol.sort_values("Date")
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(
-                x=daily_vol["Date"], y=daily_vol["Volume (lbs)"],
-                mode="lines+markers", name="Tonnage",
-                line=dict(color="#258cf4", width=2),
-                marker=dict(size=4, color="#258cf4"),
-                fill="tozeroy", fillcolor="rgba(37,140,244,0.1)",
-            ))
-            # 7-day rolling average
-            if len(daily_vol) >= 3:
-                daily_vol["Trend"] = daily_vol["Volume (lbs)"].rolling(
-                    min(7, len(daily_vol)), min_periods=1
-                ).mean()
-                fig.add_trace(go.Scatter(
-                    x=daily_vol["Date"], y=daily_vol["Trend"],
-                    mode="lines", name="7d Avg",
-                    line=dict(color="#f59e0b", width=2, dash="dot"),
-                ))
-            fig.update_layout(**_PLOTLY_LAYOUT, height=300,
-                              legend=dict(orientation="h", y=-0.15))
-            st.plotly_chart(fig)
-        else:
-            st.caption("No lifting data for selected range.")
+        _atv_l, _atv_r = st.columns([3, 1])
+        with _atv_l:
+            st.markdown(f"""
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;">
+                {get_icon('chart', 'blue', 18)}
+                <span style="font-weight:700;color:#e2e8f0;font-size:.95rem;">Training Volume</span>
+            </div>
+            """, unsafe_allow_html=True)
+        with _atv_r:
+            atv_unit = st.toggle("Show in minutes", value=False, key="atv_unit_toggle")
 
-    # ── CARDIO VOLUME (Bar by type) ─────────────────────────────────────
+        _mod_colors = {
+            "Running": "#0bda5b",
+            "Cycling": "#a78bfa",
+            "Walking": "#f59e0b",
+            "Swimming": "#38bdf8",
+            "Hiking": "#14b8a6",
+            "Weights": "#258cf4",
+        }
+
+        has_lift = not w_filtered.empty
+        has_card = not a_filtered.empty
+
+        if has_lift or has_card:
+            fig = go.Figure()
+
+            # -- Cardio bars by modality (stacked, per day) --
+            if has_card:
+                c_day = a_filtered.copy()
+                c_day["day"] = c_day["date"].dt.normalize()
+                for at in sorted(c_day["activity_type"].unique()):
+                    sub = c_day[c_day["activity_type"] == at]
+                    if sub.empty:
+                        continue
+                    if atv_unit:
+                        gd = sub.groupby("day")["duration_min"].sum().reset_index()
+                        gd.columns = ["Day", "Value"]
+                    else:
+                        gd = sub.groupby("day")["distance_miles"].sum().reset_index()
+                        gd.columns = ["Day", "Value"]
+                    color = _mod_colors.get(at, "#94a3b8")
+                    fig.add_trace(go.Bar(
+                        x=gd["Day"], y=gd["Value"],
+                        name=at, marker_color=color,
+                    ))
+
+            # -- Lifting (bars in minutes mode, line in miles/tonnage mode) --
+            if has_lift:
+                l_day = w_filtered.copy()
+                l_day["day"] = l_day["date"].dt.normalize()
+                if atv_unit:
+                    if "duration_seconds" in l_day.columns:
+                        l_day["lift_min"] = l_day["duration_seconds"].fillna(0) / 60
+                    else:
+                        l_day["lift_min"] = 0
+                    dl = l_day.groupby("day")["lift_min"].sum().reset_index()
+                    dl.columns = ["Day", "Value"]
+                    fig.add_trace(go.Bar(
+                        x=dl["Day"], y=dl["Value"],
+                        name="Lifting", marker_color="#258cf4",
+                    ))
+                else:
+                    dl = l_day.groupby("day")["tonnage_lbs"].sum().reset_index()
+                    dl.columns = ["Day", "Tonnage"]
+                    fig.add_trace(go.Scatter(
+                        x=dl["Day"], y=dl["Tonnage"],
+                        name="Lifting (tonnage)", mode="lines+markers",
+                        line=dict(color="#258cf4", width=3),
+                        marker=dict(size=5, color="#258cf4"),
+                        yaxis="y2",
+                    ))
+
+            _abase = {k: v for k, v in _PLOTLY_LAYOUT.items() if k != "yaxis"}
+            if atv_unit:
+                fig.update_layout(
+                    **_abase, height=340, barmode="stack",
+                    yaxis=dict(title="Minutes", gridcolor="rgba(255,255,255,0.05)"),
+                    legend=dict(orientation="h", y=-0.15),
+                )
+            else:
+                fig.update_layout(
+                    **_abase, height=340, barmode="stack",
+                    yaxis=dict(title="Miles", gridcolor="rgba(255,255,255,0.05)", side="left"),
+                    yaxis2=dict(title="Tonnage (lbs)", overlaying="y", side="right",
+                                gridcolor="rgba(255,255,255,0.03)"),
+                    legend=dict(orientation="h", y=-0.15),
+                )
+            _show_chart(fig, width="stretch")
+        else:
+            st.caption("No training data for selected range.")
+
+    # ── PERFORMANCE ARCHITECTURE ────────────────────────────────────────
+    st.markdown(f"### {get_icon('trending_up', 'blue', 20)} Performance Architecture", unsafe_allow_html=True)
+
     with st.container(border=True):
         st.markdown(f"""
-        <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
-            {get_icon('activity', 'green', 18)}
-            <span style="font-weight:700;color:#e2e8f0;font-size:.95rem;">Cardio Volume by Activity</span>
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;">
+            {get_icon('activity', 'blue', 18)}
+            <span style="font-weight:700;color:#e2e8f0;font-size:.95rem;">Fitness, Fatigue &amp; Form</span>
         </div>
         """, unsafe_allow_html=True)
-        if not a_filtered.empty:
-            cardio_data = a_filtered.copy()
-            cardio_data["week"] = cardio_data["date"].dt.to_period("W").dt.start_time
-            type_colors = {"Running": "#0bda5b", "Cycling": "#a78bfa", "Walking": "#f59e0b",
-                           "Swimming": "#38bdf8"}
+        st.caption("Chronic Training Load (CTL) builds fitness. Acute Training Load (ATL) tracks fatigue. The difference is your Form (TSB).")
+
+        if not w_filtered.empty or not a_filtered.empty:
+            load_parts = []
+            if not w_filtered.empty:
+                lift_load = w_filtered.groupby("date")["tonnage_lbs"].sum() / 1000
+                load_parts.append(lift_load)
+            if not a_filtered.empty:
+                cardio_load = a_filtered.groupby("date")["duration_min"].sum()
+                load_parts.append(cardio_load)
+
+            if load_parts:
+                combined = load_parts[0]
+                for lp in load_parts[1:]:
+                    combined = combined.add(lp, fill_value=0)
+                daily = combined.sort_index()
+            else:
+                daily = pd.Series(dtype=float)
+
+            idx = pd.date_range(daily.index.min(), daily.index.max())
+            daily = daily.reindex(idx, fill_value=0)
+            ctl = daily.ewm(span=42).mean()
+            atl = daily.ewm(span=7).mean()
+            tsb = ctl - atl
+            pmc_df = pd.DataFrame({"Date": idx, "Fitness (CTL)": ctl.values, "Fatigue (ATL)": atl.values, "Form (TSB)": tsb.values})
+
             fig = go.Figure()
-            for act_type in cardio_data["activity_type"].unique():
-                subset = cardio_data[cardio_data["activity_type"] == act_type]
-                wk = subset.groupby("week")["duration_min"].sum().reset_index()
-                wk.columns = ["Week", "Minutes"]
-                color = type_colors.get(act_type, "#94a3b8")
-                fig.add_trace(go.Bar(
-                    x=wk["Week"], y=wk["Minutes"],
-                    name=act_type, marker_color=color,
-                ))
-            fig.update_layout(**_PLOTLY_LAYOUT, height=300, barmode="stack",
-                              legend=dict(orientation="h", y=-0.15))
-            st.plotly_chart(fig)
+            fig.add_trace(go.Scatter(x=pmc_df["Date"], y=pmc_df["Fitness (CTL)"], name="Fitness (CTL)",
+                                     line=dict(color="#258cf4", width=3)))
+            fig.add_trace(go.Scatter(x=pmc_df["Date"], y=pmc_df["Fatigue (ATL)"], name="Fatigue (ATL)",
+                                     line=dict(color="#ec4899", width=2, dash="dot")))
+            fig.add_trace(go.Bar(x=pmc_df["Date"], y=pmc_df["Form (TSB)"], name="Form (TSB)",
+                                 marker_color=[("#0bda5b" if v >= 0 else "#ef4444") for v in pmc_df["Form (TSB)"]],
+                                 opacity=0.5))
+            fig.update_layout(**_PLOTLY_LAYOUT, height=350, barmode="overlay",
+                              legend=dict(orientation="h", y=-0.12))
+            _show_chart(fig)
+
+            _ctl_now = ctl.iloc[-1] if len(ctl) > 0 else 0
+            _atl_now = atl.iloc[-1] if len(atl) > 0 else 0
+            _tsb_now = _ctl_now - _atl_now
+            _tsb_label = "Fresh" if _tsb_now > 15 else "Recovered" if _tsb_now > 0 else "Balanced" if _tsb_now > -10 else "Deep Fatigue"
+            _tsb_color = "#0bda5b" if _tsb_now > 0 else "#f59e0b" if _tsb_now > -10 else "#ef4444"
+
+            m1, m2, m3, m4 = st.columns(4)
+            with m1:
+                st.metric("Fitness (CTL)", f"{_ctl_now:,.0f}")
+            with m2:
+                st.metric("Fatigue (ATL)", f"{_atl_now:,.0f}")
+            with m3:
+                st.metric("Form (TSB)", f"{_tsb_now:+,.0f}")
+            with m4:
+                st.markdown(f"""
+                <div style="text-align:center;padding:10px;">
+                    <div style="font-size:.75rem;color:#94a3b8;margin-bottom:4px;">STATUS</div>
+                    <div style="background:{_tsb_color}22;color:{_tsb_color};padding:6px 12px;
+                                border-radius:20px;font-weight:700;font-size:.85rem;">{_tsb_label}</div>
+                </div>
+                """, unsafe_allow_html=True)
         else:
-            st.caption("No cardio data for selected range.")
+            st.caption("No training data available for PMC.")
 
     # ── SYSTEM OPTIMIZATION ─────────────────────────────────────────────
     st.markdown(f"### {get_icon('dumbbell', 'teal', 20)} System Optimization", unsafe_allow_html=True)
@@ -1081,6 +1143,7 @@ def render_analytics(workouts_df, activities_df, nutrition_df, weight_df, using_
             <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
                 {get_icon('dumbbell', 'teal', 18)}
                 <span style="font-weight:700;color:#e2e8f0;font-size:.95rem;">Muscle Balance</span>
+                <span style="font-size:.65rem;color:#f59e0b;background:rgba(245,158,11,0.15);padding:2px 8px;border-radius:8px;margin-left:auto;">DEMO DATA</span>
             </div>
             """, unsafe_allow_html=True)
             if not w_filtered.empty and "exercise_title" in w_filtered.columns:
@@ -1105,27 +1168,28 @@ def render_analytics(workouts_df, activities_df, nutrition_df, weight_df, using_
                 w_copy = w_filtered.copy()
                 w_copy["muscle"] = w_copy["exercise_title"].apply(_muscle)
 
-                # Radar chart — sets and volume per muscle group
                 muscle_sets = w_copy.groupby("muscle").size().reset_index(name="Sets")
                 muscle_vol = w_copy.groupby("muscle")["tonnage_lbs"].sum().reset_index()
                 muscle_vol.columns = ["muscle", "Volume"]
 
-                categories = muscle_sets["muscle"].tolist()
+                _theta_labels = [f"{m} ({s})" for m, s in zip(muscle_sets["muscle"], muscle_sets["Sets"])]
+                _sets_r = muscle_sets["Sets"].tolist()
+                _theta_closed = _theta_labels + [_theta_labels[0]]
+                _sets_closed = _sets_r + [_sets_r[0]]
+
                 fig = go.Figure()
                 fig.add_trace(go.Scatterpolar(
-                    r=muscle_sets["Sets"].tolist(),
-                    theta=[f"{m} ({s})" for m, s in zip(muscle_sets["muscle"], muscle_sets["Sets"])],
+                    r=_sets_closed, theta=_theta_closed,
                     fill="toself", name="Sets",
                     line=dict(color="#6366f1"), fillcolor="rgba(99,102,241,0.15)",
                 ))
                 if not muscle_vol.empty:
-                    # Normalize volume to same scale as sets for overlay
                     _max_sets = muscle_sets["Sets"].max() if muscle_sets["Sets"].max() > 0 else 1
                     _max_vol = muscle_vol["Volume"].max() if muscle_vol["Volume"].max() > 0 else 1
                     _norm_vol = (muscle_vol["Volume"] / _max_vol * _max_sets).tolist()
+                    _vol_closed = _norm_vol + [_norm_vol[0]]
                     fig.add_trace(go.Scatterpolar(
-                        r=_norm_vol,
-                        theta=[f"{m} ({s})" for m, s in zip(muscle_sets["muscle"], muscle_sets["Sets"])],
+                        r=_vol_closed, theta=_theta_closed,
                         fill="toself", name="Volume (scaled)",
                         line=dict(color="#14b8a6"), fillcolor="rgba(20,184,166,0.1)",
                     ))
@@ -1134,7 +1198,7 @@ def render_analytics(workouts_df, activities_df, nutrition_df, weight_df, using_
                                              radialaxis=dict(visible=True, gridcolor="rgba(255,255,255,0.08)"),
                                              angularaxis=dict(gridcolor="rgba(255,255,255,0.08)")),
                                   legend=dict(orientation="h", y=-0.05))
-                st.plotly_chart(fig)
+                _show_chart(fig)
             else:
                 st.caption("No data.")
 
@@ -1142,77 +1206,169 @@ def render_analytics(workouts_df, activities_df, nutrition_df, weight_df, using_
         with st.container(border=True):
             st.markdown(f"""
             <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
-                {get_icon('activity', 'green', 18)}
-                <span style="font-weight:700;color:#e2e8f0;font-size:.95rem;">Cardio Distance</span>
+                {get_icon('heart', 'green', 18)}
+                <span style="font-weight:700;color:#e2e8f0;font-size:.95rem;">Cardio Zones</span>
             </div>
             """, unsafe_allow_html=True)
-            if not a_filtered.empty and "distance_miles" in a_filtered.columns:
-                weekly_dist = a_filtered.copy()
-                weekly_dist["week"] = weekly_dist["date"].dt.to_period("W").dt.start_time
-                wd = weekly_dist.groupby("week")["distance_miles"].sum().reset_index()
-                wd.columns = ["Week", "Miles"]
-                fig = px.bar(wd, x="Week", y="Miles", color_discrete_sequence=["#0bda5b"])
-                fig.update_layout(**_PLOTLY_LAYOUT, height=350)
-                st.plotly_chart(fig)
+            if not a_filtered.empty and "avg_hr" in a_filtered.columns:
+                def _hr_zone(hr):
+                    if pd.isna(hr) or hr == 0:
+                        return None
+                    if hr < 130:
+                        return "Zone 1 (Recovery)"
+                    elif hr < 150:
+                        return "Zone 2 (Aerobic)"
+                    elif hr < 165:
+                        return "Zone 3 (Tempo)"
+                    elif hr < 180:
+                        return "Zone 4 (Threshold)"
+                    else:
+                        return "Zone 5 (VO2max)"
+
+                act_copy = a_filtered[a_filtered["avg_hr"].notna() & (a_filtered["avg_hr"] > 0)].copy()
+                if act_copy.empty:
+                    st.caption("No HR data available.")
+                else:
+                    act_copy["zone"] = act_copy["avg_hr"].apply(_hr_zone)
+                    act_copy = act_copy[act_copy["zone"].notna()]
+                    zone_counts = act_copy.groupby("zone")["duration_min"].sum().reset_index()
+                    zone_counts.columns = ["Zone", "Minutes"]
+
+                    zone_colors = {
+                        "Zone 1 (Recovery)": "#94a3b8",
+                        "Zone 2 (Aerobic)": "#0bda5b",
+                        "Zone 3 (Tempo)": "#f59e0b",
+                        "Zone 4 (Threshold)": "#ef4444",
+                        "Zone 5 (VO2max)": "#ec4899",
+                    }
+                    colors = [zone_colors.get(z, "#258cf4") for z in zone_counts["Zone"]]
+
+                    fig = go.Figure(data=[go.Pie(
+                        labels=zone_counts["Zone"], values=zone_counts["Minutes"],
+                        hole=0, textinfo="percent",
+                        textposition="inside",
+                        marker=dict(colors=colors),
+                        textfont=dict(size=13, color="#ffffff"),
+                        insidetextorientation="horizontal",
+                    )])
+                    fig.update_layout(**_PLOTLY_LAYOUT, height=350,
+                                      showlegend=True,
+                                      legend=dict(orientation="h", y=-0.1,
+                                                  font=dict(size=11, color="#e2e8f0")))
+                    _show_chart(fig)
             else:
-                st.caption("No cardio data.")
+                st.caption("No HR data available.")
 
-    # ── RPE TREND ───────────────────────────────────────────────────────
+    # ── RUNNING PROGRESS ────────────────────────────────────────────────
     with st.container(border=True):
         st.markdown(f"""
         <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
-            {get_icon('bolt', 'orange', 18)}
-            <span style="font-weight:700;color:#e2e8f0;font-size:.95rem;">RPE Trend</span>
+            {get_icon('trending_up', 'green', 18)}
+            <span style="font-weight:700;color:#e2e8f0;font-size:.95rem;">Running Progress</span>
         </div>
         """, unsafe_allow_html=True)
-        if not w_filtered.empty and "rpe" in w_filtered.columns and w_filtered["rpe"].notna().any():
-            rpe_daily = w_filtered.groupby("date")["rpe"].mean().reset_index()
-            rpe_daily.columns = ["Date", "Avg RPE"]
-            fig = px.line(rpe_daily, x="Date", y="Avg RPE", color_discrete_sequence=["#f59e0b"])
-            fig.add_hline(y=8.5, line_dash="dash", line_color="#ef4444", annotation_text="High fatigue")
-            fig.update_traces(line_width=2)
-            fig.update_layout(**_PLOTLY_LAYOUT, height=280)
-            st.plotly_chart(fig)
-        else:
-            st.caption("No RPE data available.")
 
-    # ── EXERCISE PROGRESS ───────────────────────────────────────────────
-    with st.container(border=True):
-        st.markdown(f"""
-        <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
-            {get_icon('trending_up', 'teal', 18)}
-            <span style="font-weight:700;color:#e2e8f0;font-size:.95rem;">Exercise Progress</span>
-        </div>
-        """, unsafe_allow_html=True)
-        if not w_filtered.empty and "exercise_title" in w_filtered.columns:
-            exercises = sorted(w_filtered["exercise_title"].dropna().unique())
-            if exercises:
-                sel_ex = st.selectbox("Select exercise", exercises, key="analytics_ex_select")
-                ex_data = w_filtered[w_filtered["exercise_title"] == sel_ex].copy()
-                if not ex_data.empty:
-                    best_per_day = ex_data.groupby("date")["weight_lbs"].max().reset_index()
-                    best_per_day.columns = ["Date", "Best Weight (lbs)"]
-                    best_per_day = best_per_day.sort_values("Date")
+        if not a_filtered.empty and "distance_miles" in a_filtered.columns:
+            # Filter to running activities only
+            _runs = a_filtered[a_filtered["activity_type"] == "Running"].copy()
+            if not _runs.empty and "duration_min" in _runs.columns:
+                _runs["distance_km"] = _runs["distance_miles"] * 1.60934
+                _runs["pace_min_per_mi"] = _runs["duration_min"] / _runs["distance_miles"].replace(0, float("nan"))
+
+                # Distance buckets for selection
+                _dist_buckets = {
+                    "1 Mile": (1.4, 1.85),       # km range
+                    "5K": (4.5, 5.5),
+                    "10K": (9.0, 11.0),
+                    "Half Marathon": (19.0, 23.0),
+                    "Marathon": (40.0, 44.0),
+                    "All Runs": (0, 9999),
+                }
+                _rp_sel1, _rp_sel2 = st.columns(2)
+                with _rp_sel1:
+                    sel_dist = st.selectbox("Distance", list(_dist_buckets.keys()), key="run_progress_dist")
+                with _rp_sel2:
+                    sel_metric = st.selectbox("Metric", ["Time (min)", "Pace (min/mi)"], key="run_progress_metric")
+                lo, hi = _dist_buckets[sel_dist]
+
+                if sel_dist == "All Runs":
+                    dist_runs = _runs.copy()
+                else:
+                    dist_runs = _runs[(_runs["distance_km"] >= lo) & (_runs["distance_km"] <= hi)].copy()
+
+                if not dist_runs.empty:
+                    dist_runs = dist_runs.sort_values("date")
+                    dist_runs["time_str"] = dist_runs["duration_min"].apply(
+                        lambda m: f"{int(m // 60)}:{int(m % 60):02d}" if m >= 60 else f"{m:.1f} min"
+                    )
+                    dist_runs["pace_str"] = dist_runs["pace_min_per_mi"].apply(
+                        lambda p: f"{int(p)}:{int((p % 1) * 60):02d}/mi" if pd.notna(p) else "--"
+                    )
+
+                    _use_pace = sel_metric == "Pace (min/mi)"
+                    _y_col = "pace_min_per_mi" if _use_pace else "duration_min"
+                    _y_label = "Pace (min/mi)" if _use_pace else "Time (min)"
+                    _trace_name = "Pace" if _use_pace else "Finish Time"
+                    _text_col = "pace_str" if _use_pace else "time_str"
+                    _hover_fmt = "%{x|%b %d, %Y}<br>Pace: %{text}<extra></extra>" if _use_pace else "%{x|%b %d, %Y}<br>Time: %{text}<br>%{y:.1f} min<extra></extra>"
+
                     fig = go.Figure()
                     fig.add_trace(go.Scatter(
-                        x=best_per_day["Date"], y=best_per_day["Best Weight (lbs)"],
-                        mode="markers", name="Best Set",
-                        marker=dict(color="#258cf4", size=8),
+                        x=dist_runs["date"], y=dist_runs[_y_col],
+                        mode="markers", name=_trace_name,
+                        marker=dict(color="#0bda5b", size=9),
+                        text=dist_runs[_text_col],
+                        hovertemplate=_hover_fmt,
                     ))
-                    # Rolling trend line instead of lowess (avoids statsmodels dependency)
-                    if len(best_per_day) >= 3:
-                        trend = best_per_day["Best Weight (lbs)"].rolling(
-                            min(5, len(best_per_day)), min_periods=1, center=True
+                    if len(dist_runs) >= 3:
+                        _trend = dist_runs[_y_col].rolling(
+                            min(5, len(dist_runs)), min_periods=1, center=True
                         ).mean()
                         fig.add_trace(go.Scatter(
-                            x=best_per_day["Date"], y=trend,
+                            x=dist_runs["date"], y=_trend,
                             mode="lines", name="Trend",
-                            line=dict(color="#6366f1", width=2, dash="dot"),
+                            line=dict(color="#258cf4", width=2, dash="dot"),
                         ))
-                    fig.update_layout(**_PLOTLY_LAYOUT, height=300)
-                    st.plotly_chart(fig)
+                    fig.update_layout(**_PLOTLY_LAYOUT, height=320,
+                                      yaxis_title=_y_label,
+                                      legend=dict(orientation="h", y=-0.12))
+                    _show_chart(fig)
+
+                    # Summary metrics
+                    _best_time = dist_runs["duration_min"].min()
+                    _avg_time = dist_runs["duration_min"].mean()
+                    _latest_time = dist_runs.iloc[-1]["duration_min"]
+                    _best_pace = dist_runs["pace_min_per_mi"].min()
+                    _avg_pace = dist_runs["pace_min_per_mi"].mean()
+                    _latest_pace = dist_runs.iloc[-1]["pace_min_per_mi"]
+                    _n = len(dist_runs)
+                    _fmt_t = lambda m: f"{int(m // 60)}:{int(m % 60):02d}" if m >= 60 else f"{m:.1f}m"
+                    _fmt_p = lambda p: f"{int(p)}:{int((p % 1) * 60):02d}/mi" if pd.notna(p) else "--"
+                    rm1, rm2, rm3, rm4 = st.columns(4)
+                    if _use_pace:
+                        with rm1:
+                            st.metric("Best Pace", _fmt_p(_best_pace))
+                        with rm2:
+                            st.metric("Avg Pace", _fmt_p(_avg_pace))
+                        with rm3:
+                            st.metric("Latest Pace", _fmt_p(_latest_pace))
+                        with rm4:
+                            st.metric("Runs", str(_n))
+                    else:
+                        with rm1:
+                            st.metric("PR", _fmt_t(_best_time))
+                        with rm2:
+                            st.metric("Average", _fmt_t(_avg_time))
+                        with rm3:
+                            st.metric("Latest", _fmt_t(_latest_time))
+                        with rm4:
+                            st.metric("Runs", str(_n))
+                else:
+                    st.caption(f"No {sel_dist} runs found in selected range.")
+            else:
+                st.caption("No running data available.")
         else:
-            st.caption("No exercise data.")
+            st.caption("No cardio data available.")
 
 
 # =============================================================================
@@ -1343,8 +1499,39 @@ def render_plan():
 # =============================================================================
 
 def render_race_prep(workouts_df, activities_df):
-    """Race preparation page."""
+    """Race preparation page with auto-estimated times from Strava data."""
     st.markdown(f"### {get_icon('trophy', 'orange', 20)} Race Prep", unsafe_allow_html=True)
+
+    # Pull best run efforts from Strava if available
+    best_runs = st.session_state.get("strava_best_runs", {})
+    has_strava_runs = any(v is not None for v in best_runs.values())
+
+    if has_strava_runs:
+        st.markdown(f"""
+        <div style="background:rgba(11,218,91,0.08);border:1px solid rgba(11,218,91,0.25);
+                    border-radius:12px;padding:14px 18px;margin-bottom:16px;
+                    display:flex;align-items:center;gap:10px;">
+            {get_icon('check_circle', 'green', 20)}
+            <span style="color:#0bda5b;font-weight:600;font-size:.9rem;">
+                Race times auto-detected from your Strava history
+            </span>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # Show detected personal bests
+        st.markdown(f"#### {get_icon('medal', 'orange', 18)} Your Personal Bests", unsafe_allow_html=True)
+        pb_cols = st.columns(len([v for v in best_runs.values() if v is not None]))
+        col_idx = 0
+        for dist_label, time_min in best_runs.items():
+            if time_min is None:
+                continue
+            hours = int(time_min // 60)
+            mins = int(time_min % 60)
+            secs = int((time_min % 1) * 60)
+            time_str = f"{hours}:{mins:02d}:{secs:02d}" if hours > 0 else f"{mins}:{secs:02d}"
+            with pb_cols[col_idx]:
+                render_custom_metric_card("timer", "green", dist_label, time_str, "Personal Best", "good")
+            col_idx += 1
 
     st.markdown("""
     <div style="background:rgba(30,41,59,0.5);border:1px solid rgba(255,255,255,0.08);
@@ -1359,114 +1546,270 @@ def render_race_prep(workouts_df, activities_df):
     </div>
     """, unsafe_allow_html=True)
 
-    # Pace estimator demo
-    st.markdown(f"#### {get_icon('speed', 'green', 18)} Pace Estimator (Demo)", unsafe_allow_html=True)
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        ref_dist = st.selectbox("Reference distance", ["5K", "10K", "Half Marathon"], key="rp_ref")
-    with col2:
-        ref_time = st.number_input("Time (minutes)", min_value=10, max_value=300, value=25, key="rp_time")
-    with col3:
-        target_dist = st.selectbox("Predict for", ["10K", "Half Marathon", "Marathon"], key="rp_target")
+    # Pace estimator — fully driven by Strava data
+    st.markdown(f"#### {get_icon('speed', 'green', 18)} Pace Estimator", unsafe_allow_html=True)
 
-    dist_map = {"5K": 5.0, "10K": 10.0, "Half Marathon": 21.1, "Marathon": 42.2}
-    d1 = dist_map.get(ref_dist, 5.0)
-    d2 = dist_map.get(target_dist, 10.0)
-    # Riegel formula: T2 = T1 * (D2/D1)^1.06
-    predicted = ref_time * (d2 / d1) ** 1.06
-    hours = int(predicted // 60)
-    mins = int(predicted % 60)
-    secs = int((predicted % 1) * 60)
-    time_str = f"{hours}:{mins:02d}:{secs:02d}" if hours > 0 else f"{mins}:{secs:02d}"
-    pace_per_km = predicted / d2
-    pace_min = int(pace_per_km)
-    pace_sec = int((pace_per_km % 1) * 60)
+    if not has_strava_runs:
+        st.caption("Connect Strava in **Settings** to see pace predictions based on your run history.")
+    else:
+        # Build predictions from each available PB using Riegel formula
+        ref_options = [d for d in ["5K", "10K", "Half Marathon"] if best_runs.get(d) is not None]
+        target_options = ["10K", "Half Marathon", "Marathon"]
 
-    r1, r2 = st.columns(2)
-    with r1:
-        render_custom_metric_card("timer", "green", "Predicted Time", time_str,
-                                  f"Based on {ref_dist} in {ref_time} min", "good")
-    with r2:
-        render_custom_metric_card("speed", "blue", "Predicted Pace", f"{pace_min}:{pace_sec:02d}/km",
-                                  f"For {target_dist}", "maintenance")
+        col1, col2 = st.columns(2)
+        with col1:
+            ref_dist = st.selectbox("Reference distance", ref_options, key="rp_ref")
+        with col2:
+            target_dist = st.selectbox("Predict for", target_options, key="rp_target")
+
+        ref_time = best_runs[ref_dist]  # minutes (from Strava PB)
+        dist_map = {"5K": 5.0, "10K": 10.0, "Half Marathon": 21.1, "Marathon": 42.2}
+        d1 = dist_map.get(ref_dist, 5.0)
+        d2 = dist_map.get(target_dist, 10.0)
+        # Riegel formula: T2 = T1 * (D2/D1)^1.06
+        predicted = ref_time * (d2 / d1) ** 1.06
+        hours = int(predicted // 60)
+        mins = int(predicted % 60)
+        secs = int((predicted % 1) * 60)
+        time_str = f"{hours}:{mins:02d}:{secs:02d}" if hours > 0 else f"{mins}:{secs:02d}"
+        pace_per_km = predicted / d2
+        pace_min = int(pace_per_km)
+        pace_sec = int((pace_per_km % 1) * 60)
+
+        ref_h = int(ref_time // 60)
+        ref_m = int(ref_time % 60)
+        ref_s = int((ref_time % 1) * 60)
+        ref_str = f"{ref_h}:{ref_m:02d}:{ref_s:02d}" if ref_h > 0 else f"{ref_m}:{ref_s:02d}"
+
+        r1, r2 = st.columns(2)
+        with r1:
+            render_custom_metric_card("timer", "green", "Predicted Time", time_str,
+                                      f"Based on {ref_dist} PB of {ref_str} (Strava)", "good")
+        with r2:
+            render_custom_metric_card("speed", "blue", "Predicted Pace", f"{pace_min}:{pace_sec:02d}/km",
+                                      f"For {target_dist}", "maintenance")
 
     # Training readiness for race
     st.markdown(f"#### {get_icon('target', 'red', 18)} Race Readiness", unsafe_allow_html=True)
-    if not workouts_df.empty:
+    has_activity_data = (not workouts_df.empty) or (activities_df is not None and not activities_df.empty)
+
+    if has_activity_data:
         acwr = _compute_acwr(workouts_df)
-        last_7 = _filter_by_range(workouts_df, "1W")
-        sess_count = last_7["date"].nunique() if not last_7.empty else 0
-        metrics = {
-            "Training Consistency": min(100, sess_count * 20),
-            "Volume Trend": 75 if acwr["acwr"] and 0.8 <= acwr["acwr"] <= 1.3 else 50,
-            "Taper Status": 60,
+        cardio_acwr = _compute_cardio_acwr(activities_df)
+        l_acwr = acwr.get("acwr")
+        c_acwr = cardio_acwr.get("acwr")
+
+        # Consistency: count unique active days in last 28 days
+        last_28_w = _filter_by_range(workouts_df, "1M")
+        last_28_c = _filter_by_range(activities_df, "1M") if activities_df is not None else pd.DataFrame()
+        lift_days_28 = last_28_w["date"].dt.normalize().nunique() if not last_28_w.empty else 0
+        cardio_days_28 = last_28_c["date"].dt.normalize().nunique() if not last_28_c.empty else 0
+        total_active_28 = min(28, lift_days_28 + cardio_days_28)
+        consistency_score = min(100, int(total_active_28 / 28 * 125))  # ~4-5 days/wk = 100%
+
+        # ACWR-based load balance (optimal 0.8-1.3)
+        def _acwr_score(val):
+            if val is None:
+                return 40
+            if 0.8 <= val <= 1.3:
+                return min(100, int(80 + (1.0 - abs(val - 1.05) / 0.25) * 20))
+            if 0.6 <= val < 0.8 or 1.3 < val <= 1.5:
+                return 55
+            return 30
+
+        vol_score = _acwr_score(l_acwr)
+        cardio_score = _acwr_score(c_acwr)
+
+        # Volume trend (last 4 weeks vs prior 4 weeks of cardio)
+        if activities_df is not None and not activities_df.empty:
+            _now = pd.Timestamp.now().normalize()
+            _recent_4w = activities_df[activities_df["date"] >= _now - pd.Timedelta(days=28)]
+            _prior_4w = activities_df[(activities_df["date"] >= _now - pd.Timedelta(days=56)) &
+                                      (activities_df["date"] < _now - pd.Timedelta(days=28))]
+            _recent_vol = _recent_4w["duration_min"].sum() if not _recent_4w.empty else 0
+            _prior_vol = _prior_4w["duration_min"].sum() if not _prior_4w.empty else 0
+            if _prior_vol > 0:
+                _vol_ratio = _recent_vol / _prior_vol
+                taper_score = 80 if 0.6 <= _vol_ratio <= 0.85 else (70 if _vol_ratio < 1.0 else 50)
+            else:
+                taper_score = 50
+        else:
+            taper_score = 50
+
+        overall = int((consistency_score + vol_score + cardio_score + taper_score) / 4)
+        _ov_color = "#0bda5b" if overall >= 70 else "#f59e0b" if overall >= 50 else "#ef4444"
+
+        st.markdown(f"""
+        <div style="text-align:center;padding:12px 0 16px;">
+            <div style="font-size:2.5rem;font-weight:700;color:{_ov_color};">{overall}%</div>
+            <div style="font-size:.75rem;color:#94a3b8;">OVERALL READINESS</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        _readiness_items = {
+            "Training Consistency": (consistency_score, f"{total_active_28} days active / 28"),
+            "Lifting Load Balance": (vol_score, f"ACWR {l_acwr:.2f}" if l_acwr else "No data"),
+            "Cardio Load Balance": (cardio_score, f"ACWR {c_acwr:.2f}" if c_acwr else "No data"),
+            "Taper Status": (taper_score, f"Vol ratio {_vol_ratio:.0%}" if activities_df is not None and not activities_df.empty and _prior_vol > 0 else "Needs more data"),
         }
-        for label, score in metrics.items():
-            col_l, col_r = st.columns([3, 1])
+        for label, (score, detail) in _readiness_items.items():
+            col_l, col_m, col_r = st.columns([3, 2, 1])
             with col_l:
                 st.progress(score / 100, text=label)
+            with col_m:
+                st.caption(detail)
             with col_r:
                 st.markdown(f"**{score}%**")
     else:
-        st.caption("Upload workout data to see race readiness metrics.")
+        st.caption("Connect Strava in Settings to see race readiness metrics.")
 
 
 # =============================================================================
 # PAGE: SETTINGS
 # =============================================================================
 
+def _handle_strava_callback():
+    """Process the Strava OAuth callback if an auth code is in the URL."""
+    params = st.query_params
+    code = params.get("code")
+    if code and not st.session_state.get("_strava_exchanged"):
+        if _STRAVA_CLIENT_ID and _STRAVA_CLIENT_SECRET:
+            try:
+                strava_exchange_code(_STRAVA_CLIENT_ID, _STRAVA_CLIENT_SECRET, code)
+                st.session_state["_strava_exchanged"] = True
+                # Clear the auth code from the URL
+                st.query_params.clear()
+                st.rerun()
+            except Exception as e:
+                st.error(f"Strava authorization failed: {e}")
+
+
+def _sync_strava():
+    """Fetch Strava activities and store in session state."""
+    if not _STRAVA_CLIENT_ID or not _STRAVA_CLIENT_SECRET:
+        st.warning("Strava credentials not configured. See `.streamlit/secrets.toml`.")
+        return
+    try:
+        activities_df, workouts_df, best_runs, fastest_routes, raw = _fetch_strava(_STRAVA_CLIENT_ID, _STRAVA_CLIENT_SECRET)
+        st.session_state["strava_activities_df"] = activities_df
+        st.session_state["strava_workouts_df"] = workouts_df
+        st.session_state["strava_best_runs"] = best_runs
+        st.session_state["strava_fastest_routes"] = fastest_routes
+        st.session_state["strava_raw"] = raw
+    except Exception as e:
+        st.error(f"Strava sync failed: {e}")
+
+
 def render_settings():
-    """Settings page — only Hevy CSV upload."""
+    """Settings page — Strava Connect and data status."""
     st.markdown(f"### {get_icon('settings', 'blue', 20)} Settings", unsafe_allow_html=True)
 
-    # --- Data Import ---
-    st.markdown(f"#### {get_icon('upload', 'green', 18)} Import Workout Data", unsafe_allow_html=True)
-    st.caption("Upload your Hevy workout export CSV to see your real training data.")
+    # Handle OAuth callback if redirected back from Strava
+    _handle_strava_callback()
 
-    uploaded_file = st.file_uploader(
-        "Upload Hevy CSV",
-        type=["csv"],
-        key="hevy_uploader",
-        label_visibility="collapsed",
-    )
+    # --- Strava Connect ---
+    st.markdown(f"#### {get_icon('strava', 'orange', 18)} Connect Strava", unsafe_allow_html=True)
+    st.caption("Link your Strava account to pull real activity data into the dashboard.")
 
-    if uploaded_file is not None:
-        try:
-            df = _load_hevy(uploaded_file.getvalue())
-            st.session_state["workouts_df"] = df
-            st.success(f"Loaded {len(df):,} sets from {df['date'].nunique()} sessions.")
-            st.rerun()
-        except Exception as e:
-            st.error(f"Failed to parse CSV: {e}")
+    connected = strava_is_connected()
+    has_credentials = bool(_STRAVA_CLIENT_ID and _STRAVA_CLIENT_SECRET)
+
+    if not has_credentials:
+        st.warning(
+            "Strava API credentials not found.  \n"
+            "Add your **Client ID** and **Client Secret** to "
+            "`.streamlit/secrets.toml` and restart the app."
+        )
+        st.code(
+            '# .streamlit/secrets.toml\n'
+            'STRAVA_CLIENT_ID = "your-client-id"\n'
+            'STRAVA_CLIENT_SECRET = "your-client-secret"',
+            language="toml",
+        )
+    elif connected:
+        # Show connected state
+        tokens = strava_load_tokens()
+        athlete_id = tokens.get("athlete_id", "Unknown") if tokens else "Unknown"
+        st.markdown(f"""
+        <div style="background:rgba(11,218,91,0.1);border:1px solid rgba(11,218,91,0.3);
+                    border-radius:12px;padding:16px;display:flex;align-items:center;gap:12px;">
+            {get_icon('check_circle', 'green', 24)}
+            <div>
+                <div style="color:#0bda5b;font-weight:700;font-size:.95rem;">Strava Connected</div>
+                <div style="color:#94a3b8;font-size:.75rem;">Athlete ID: {athlete_id}</div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        col_sync, col_disconnect = st.columns(2)
+        with col_sync:
+            if st.button(f"Sync Activities", key="strava_sync", type="primary", width="stretch"):
+                _sync_strava()
+                st.rerun()
+        with col_disconnect:
+            if st.button("Disconnect Strava", key="strava_disconnect", type="secondary", width="stretch"):
+                strava_clear_tokens()
+                for k in ("strava_activities_df", "strava_workouts_df",
+                          "strava_best_runs", "strava_fastest_routes", "strava_raw", "_strava_exchanged"):
+                    st.session_state.pop(k, None)
+                _fetch_strava.clear()
+                st.rerun()
+
+        # Auto-sync on first load if connected
+        if "strava_activities_df" not in st.session_state:
+            _sync_strava()
+    elif has_credentials:
+        # Not connected yet — show the connect button
+        auth_url = strava_auth_url(_STRAVA_CLIENT_ID, _STRAVA_REDIRECT_URI)
+        st.markdown(f"""
+        <a href="{auth_url}" target="_self" style="
+            display:inline-flex;align-items:center;gap:10px;
+            background:#FC4C02;color:#fff;font-weight:700;
+            padding:12px 24px;border-radius:8px;text-decoration:none;
+            font-size:.95rem;letter-spacing:.02em;
+            box-shadow:0 4px 14px rgba(252,76,2,0.4);
+            transition:all .2s ease;">
+            {get_icon('strava', 'white', 20)}
+            Connect with Strava
+        </a>
+        """, unsafe_allow_html=True)
 
     # Show current data status
     st.markdown("---")
     st.markdown(f"#### {get_icon('info', 'blue', 18)} Data Status", unsafe_allow_html=True)
-    wdf = st.session_state.get("workouts_df")
-    if wdf is not None and not wdf.empty and not is_demo_data(wdf):
-        st.success(f"**Hevy data loaded:** {len(wdf):,} sets across {wdf['date'].nunique()} sessions")
-        date_range = f"{wdf['date'].min().strftime('%b %d, %Y')} — {wdf['date'].max().strftime('%b %d, %Y')}"
+    act_df = st.session_state.get("strava_activities_df")
+    wkt_df = st.session_state.get("strava_workouts_df")
+    best = st.session_state.get("strava_best_runs", {})
+    has_any = (act_df is not None and not act_df.empty) or (wkt_df is not None and not wkt_df.empty)
+    if has_any:
+        n_cardio = len(act_df) if act_df is not None else 0
+        n_lifting = len(wkt_df) if wkt_df is not None else 0
+        all_dates = pd.concat([
+            act_df[["date"]] if act_df is not None and not act_df.empty else pd.DataFrame(),
+            wkt_df[["date"]] if wkt_df is not None and not wkt_df.empty else pd.DataFrame(),
+        ])
+        date_range = f"{all_dates['date'].min().strftime('%b %d, %Y')} — {all_dates['date'].max().strftime('%b %d, %Y')}"
+        st.success(f"**Strava data loaded:** {n_cardio:,} cardio activities, {n_lifting:,} strength sessions")
         st.caption(f"Date range: {date_range}")
-        if st.button("Clear uploaded data", type="secondary", key="clear_hevy"):
-            st.session_state.pop("workouts_df", None)
-            _load_hevy.clear()
-            st.rerun()
+        if any(v is not None for v in best.values()):
+            pb_str = " · ".join(f"{k}: {int(v)}min" for k, v in best.items() if v is not None)
+            st.caption(f"Detected PBs: {pb_str}")
     else:
-        st.warning("No Hevy data uploaded. Using demo data for all visualisations.")
+        st.warning("No Strava data synced. Using demo data for all visualisations.")
 
     # --- Demo data info ---
     st.markdown("---")
     st.markdown(f"#### {get_icon('lightbulb', 'orange', 18)} About Demo Data", unsafe_allow_html=True)
     st.markdown("""
-    When no Hevy export is uploaded, Saker Pro displays **120 days of synthetic
+    When Strava is not connected, Saker Pro displays **120 days of synthetic
     training data** including:
     - **Workouts:** Push/Pull/Legs split with progressive overload
     - **Cardio:** Running, cycling, and walking activities
     - **Nutrition:** ~2,400 kcal/day with macro breakdown
     - **Weight:** Gradual trend with realistic daily variance
 
-    All cardio, nutrition, and weight data is always synthetic in this demo.
-    The full desktop version supports Garmin, Apple Health, MacroFactor, and more.
+    Nutrition and weight data is always synthetic in this demo.
+    The full desktop version supports Garmin, Hevy, MacroFactor, and more.
     """)
 
     # --- About ---
@@ -1479,7 +1822,7 @@ def render_settings():
     dashboard and analytics capabilities. The full desktop version includes:
     - Local LLM coaching via llama.cpp (100% offline)
     - Periodised plan generation with calendar export
-    - Garmin / Apple Health / MacroFactor integration
+    - Garmin / Hevy / MacroFactor integration
     - Injury tracking with Physio-Bot
     - Advanced race preparation tools
     """)

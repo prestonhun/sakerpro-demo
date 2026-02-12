@@ -1,5 +1,7 @@
 # Environment & Secrets
 .env
+.streamlit/secrets.toml
+saker_pro_source/.streamlit/secrets.toml
 
 # Python
 __pycache__/

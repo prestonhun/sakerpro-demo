@@ -208,6 +208,11 @@ def get_icon(name, color="white", size=24):
         # Delete / Trash
         "delete": f"""<path d="M3 6h18" stroke="url(#{grad_id})" stroke-width="2" stroke-linecap="round"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" stroke="url(#{grad_id})" stroke-width="2" fill="none"/>""",
         
+        # Strava / Connect
+        "strava": f"""<path d="M15.387 17.944l-2.089-4.116h-3.065L15.387 24l5.15-10.172h-3.066m-7.008-5.599l2.836 5.598h4.172L10.463 0l-7 13.828h4.169" fill="url(#{grad_id})"/>""",
+
+        "link": f"""<path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" stroke="url(#{grad_id})" stroke-width="2" stroke-linecap="round" fill="none"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" stroke="url(#{grad_id})" stroke-width="2" stroke-linecap="round" fill="none"/>""",
+
         # Add / Plus
         "add": f"""<line x1="12" y1="5" x2="12" y2="19" stroke="url(#{grad_id})" stroke-width="2" stroke-linecap="round"/><line x1="5" y1="12" x2="19" y2="12" stroke="url(#{grad_id})" stroke-width="2" stroke-linecap="round"/>""",
         
