@@ -9,6 +9,7 @@ Supports Strava Connect for real activity data; other sources use demo data.
 import base64
 import sys
 from pathlib import Path
+import importlib.util
 
 # Ensure imports work both locally and on Streamlit Community Cloud.
 # Cloud runs from the repo root, so we add both:
@@ -65,35 +66,79 @@ try:
         render_activity_start_map_section,
     )
 except ModuleNotFoundError:
-    from data.demo_data import (
-        generate_all_demo_data,
-        generate_demo_activities,
-        generate_demo_nutrition,
-        generate_demo_weight,
-        is_demo_data,
-    )
-    from data.strava import (
-        is_connected as strava_is_connected,
-        get_authorization_url as strava_auth_url,
-        exchange_code as strava_exchange_code,
-        clear_tokens as strava_clear_tokens,
-        load_tokens as strava_load_tokens,
-        fetch_activities as strava_fetch_activities,
-        get_athlete as strava_get_athlete,
-        activities_to_cardio_df,
-        activities_to_workouts_df,
-        get_best_run_efforts,
-        get_fastest_run_routes,
-        enrich_activity_locations,
-    )
-    from ui.icons import get_icon
-    from ui.theme import apply_new_styles
-    from ui.widgets import (
-        render_custom_metric_card,
-        render_timeline_buttons,
-        render_fastest_run_map_section,
-        render_activity_start_map_section,
-    )
+    try:
+        from data.demo_data import (
+            generate_all_demo_data,
+            generate_demo_activities,
+            generate_demo_nutrition,
+            generate_demo_weight,
+            is_demo_data,
+        )
+        from data.strava import (
+            is_connected as strava_is_connected,
+            get_authorization_url as strava_auth_url,
+            exchange_code as strava_exchange_code,
+            clear_tokens as strava_clear_tokens,
+            load_tokens as strava_load_tokens,
+            fetch_activities as strava_fetch_activities,
+            get_athlete as strava_get_athlete,
+            activities_to_cardio_df,
+            activities_to_workouts_df,
+            get_best_run_efforts,
+            get_fastest_run_routes,
+            enrich_activity_locations,
+        )
+        from ui.icons import get_icon
+        from ui.theme import apply_new_styles
+        from ui.widgets import (
+            render_custom_metric_card,
+            render_timeline_buttons,
+            render_fastest_run_map_section,
+            render_activity_start_map_section,
+        )
+    except ModuleNotFoundError:
+        # Final fallback: load modules directly from file paths.
+        def _load_module(name: str, path: Path):
+            spec = importlib.util.spec_from_file_location(name, str(path))
+            if spec is None or spec.loader is None:
+                raise ModuleNotFoundError(f"Cannot load module {name} from {path}")
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules[name] = mod
+            spec.loader.exec_module(mod)
+            return mod
+
+        _demo = _load_module("_saker_demo_data", _SAKER_DIR / "data" / "demo_data.py")
+        _strava = _load_module("_saker_strava", _SAKER_DIR / "data" / "strava.py")
+        _icons = _load_module("_saker_icons", _SAKER_DIR / "ui" / "icons.py")
+        _theme = _load_module("_saker_theme", _SAKER_DIR / "ui" / "theme.py")
+        _widgets = _load_module("_saker_widgets", _SAKER_DIR / "ui" / "widgets.py")
+
+        generate_all_demo_data = _demo.generate_all_demo_data
+        generate_demo_activities = _demo.generate_demo_activities
+        generate_demo_nutrition = _demo.generate_demo_nutrition
+        generate_demo_weight = _demo.generate_demo_weight
+        is_demo_data = _demo.is_demo_data
+
+        strava_is_connected = _strava.is_connected
+        strava_auth_url = _strava.get_authorization_url
+        strava_exchange_code = _strava.exchange_code
+        strava_clear_tokens = _strava.clear_tokens
+        strava_load_tokens = _strava.load_tokens
+        strava_fetch_activities = _strava.fetch_activities
+        strava_get_athlete = _strava.get_athlete
+        activities_to_cardio_df = _strava.activities_to_cardio_df
+        activities_to_workouts_df = _strava.activities_to_workouts_df
+        get_best_run_efforts = _strava.get_best_run_efforts
+        get_fastest_run_routes = _strava.get_fastest_run_routes
+        enrich_activity_locations = _strava.enrich_activity_locations
+
+        get_icon = _icons.get_icon
+        apply_new_styles = _theme.apply_new_styles
+
+        render_custom_metric_card = _widgets.render_custom_metric_card
+        render_timeline_buttons = _widgets.render_timeline_buttons
+        render_fastest_run_map_section = _widgets.render_fastest_run_map_section
+        render_activity_start_map_section = _widgets.render_activity_start_map_section
 
 # =============================================================================
 # PAGE CONFIG (MUST be first Streamlit command)
